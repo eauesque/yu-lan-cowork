@@ -1,0 +1,13 @@
+/target
+Cargo.lock
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Agent and session artifacts. `!*.md`-style negations must never be added
+# above these — gitignore resolves by LAST matching rule, and a broad
+# negation silently defeats earlier ignores.
+.claude/
+**/.claude/
+*.jsonl

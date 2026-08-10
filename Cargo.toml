@@ -1,0 +1,58 @@
+[package]
+name        = "lan-cowork"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "LAN peer pairing, fleet dispatch and cross-node cowork routes. Host-agnostic axum routes behind a LanCoworkHost trait."
+repository  = "https://github.com/eauesque/yu-lan-cowork"
+
+# Dependency versions are written out explicitly: this crate is consumed as a
+# standalone git dependency and has no workspace to inherit from.
+
+[dependencies]
+libc           = "0.2"
+axum           = { version = "0.8", features = ["macros", "multipart"] }
+tokio          = { version = "1", features = ["full", "test-util"] }
+sqlx           = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+reqwest        = { version = "0.12", default-features = false, features = ["json", "cookies", "stream", "rustls-tls"] }
+url            = "2"
+thiserror      = "2"
+sha2           = "0.10"
+hmac           = "0.12"
+rand           = { version = "0.9", features = ["os_rng"] }
+tower-sessions = { version = "0.15", features = ["memory-store"] }
+hex            = "0.4"
+base64         = "0.22"
+tower-http     = { version = "0.6", features = ["fs"] }
+chrono         = { version = "0.4", features = ["serde"] }
+uuid           = { version = "1", features = ["v4"] }
+futures-util   = "0.3"
+async-trait    = "0.1"
+regex          = "1"
+subtle         = "2"
+tracing        = "0.1"
+openssl        = "0.10"
+indexmap       = { version = "2", features = ["serde"] }
+scrypt         = { version = "0.11", default-features = false }
+tokio-util     = { version = "0.7", features = ["io"] }
+socket2        = "0.6"
+tempfile       = "3"
+zip            = { version = "2", default-features = false, features = ["deflate"] } # import ZIP (MIT OR Apache-2.0)
+dirs           = "5"
+urlencoding    = "2"
+
+[dev-dependencies]
+tower = "0.5"
+
+# Test seams that production code must not contain. `TEST_ALLOW_LOOPBACK` makes
+# loopback addresses pass a network reachability guard, `TEST_DESCRIPTOR`
+# replaces local descriptor resolution outright, `PeerRegistry::insert_for_test`
+# writes a peer straight into the in-memory trust registry, and `sign_headers`
+# signs peer-transport headers. Each is compiled only under `cfg(test)` or this
+# feature, so a normal dependent build cannot reach them. Never enable it from
+# `[dependencies]`; a host that needs them in its own integration tests should
+# enable it from `[dev-dependencies]` only.
+[features]
+test-seams = []
