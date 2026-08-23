@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -536,6 +536,35 @@ pub async fn require_peer_renew_auth(
     Ok(peer_id)
 }
 
+/// Inputs used to sign peer request headers.
+pub struct PeerHeaderSigningInput<'a> {
+    pub seed: &'a [u8],
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: &'a str,
+    pub body: &'a [u8],
+    pub ts: i64,
+    pub nonce: &'a str,
+    pub peer_id: &'a str,
+}
+
+/// Signs peer request headers; the caller supplies the timestamp and nonce.
+pub fn sign_peer_headers(input: PeerHeaderSigningInput<'_>) -> Option<HeaderMap> {
+    let ts_s = input.ts.to_string();
+    let canonical =
+        build_canonical_message(input.method, input.path, input.query, &ts_s, input.body);
+    let sig = sign_canonical(input.seed, &canonical)?;
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE.encode(sig);
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Peer-Id", HeaderValue::from_str(input.peer_id).ok()?);
+    headers.insert("X-Peer-Ts", HeaderValue::from_str(&ts_s).ok()?);
+    headers.insert("X-Peer-Sig", HeaderValue::from_str(&sig_b64).ok()?);
+    if !input.nonce.is_empty() {
+        headers.insert("X-Peer-Nonce", HeaderValue::from_str(input.nonce).ok()?);
+    }
+    Some(headers)
+}
+
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 // Keep the test-seam signature stable for downstream integration tests.
@@ -550,18 +579,17 @@ pub fn sign_headers(
     nonce: &str,
     peer_id: &str,
 ) -> HeaderMap {
-    let ts_s = ts.to_string();
-    let canonical = build_canonical_message(method, path, query, &ts_s, body);
-    let sig = sign_canonical(seed, &canonical).unwrap();
-    let sig_b64 = base64::engine::general_purpose::URL_SAFE.encode(&sig);
-    let mut h = HeaderMap::new();
-    h.insert("X-Peer-Id", peer_id.parse().unwrap());
-    h.insert("X-Peer-Ts", ts_s.parse().unwrap());
-    h.insert("X-Peer-Sig", sig_b64.parse().unwrap());
-    if !nonce.is_empty() {
-        h.insert("X-Peer-Nonce", nonce.parse().unwrap());
-    }
-    h
+    sign_peer_headers(PeerHeaderSigningInput {
+        seed,
+        method,
+        path,
+        query,
+        body,
+        ts,
+        nonce,
+        peer_id,
+    })
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -733,6 +761,53 @@ mod tests {
                 case["path"]
             );
         }
+    }
+
+    #[test]
+    fn production_header_signing_matches_test_seam() {
+        let seed = seed_bytes();
+        let input = PeerHeaderSigningInput {
+            seed: &seed,
+            method: "POST",
+            path: "/api/peer/renew",
+            query: "x=1",
+            body: br#"{"hello":1}"#,
+            ts: 1_700_000_000,
+            nonce: "nonce",
+            peer_id: "peer-1",
+        };
+
+        assert_eq!(
+            sign_peer_headers(input).unwrap(),
+            sign_headers(
+                &seed,
+                "POST",
+                "/api/peer/renew",
+                "x=1",
+                br#"{"hello":1}"#,
+                1_700_000_000,
+                "nonce",
+                "peer-1",
+            ),
+        );
+    }
+
+    #[test]
+    fn production_header_signing_rejects_invalid_peer_id() {
+        let peer_id = "peer\n1";
+        assert!(HeaderValue::from_str(peer_id).is_err());
+
+        assert!(sign_peer_headers(PeerHeaderSigningInput {
+            seed: &seed_bytes(),
+            method: "POST",
+            path: "/api/peer/renew",
+            query: "",
+            body: b"",
+            ts: 1_700_000_000,
+            nonce: "nonce",
+            peer_id,
+        })
+        .is_none());
     }
 
     #[test]

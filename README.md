@@ -1,12 +1,25 @@
 # yu-lan-cowork
 
-LAN peer pairing, fleet dispatch, and cross-node cowork routes: host-agnostic
-axum routes for machines that discover each other on a local network, pair with
-a short-lived PIN, and then dispatch work between themselves over signed HTTP.
+LAN peer pairing, fleet dispatch, and cross-node cowork routes — the part of
+[yu_ai_manager](https://github.com/habe358/yu_ai_manager) that talks to other
+machines.
 
-It is a separate crate so that **it can be security-reviewed on its own.**
+It is a separate repository so that **it can be security-reviewed on its own.**
 Everything here handles peer identity, pairing secrets, tokens, and remote
 command dispatch; none of it needs the rest of the application to be understood.
+
+## Status: mirror, not yet the source of truth
+
+> yu_ai_manager's Rust migration is still in progress, and neither repository is
+> public yet. Until both go public **together**:
+>
+> - The source of truth is `crates/lan-cowork` inside yu_ai_manager.
+> - This repository is a mirror kept in step by
+>   `scripts/sync-from-yu-ai-manager.sh`, which has a `--check` mode that fails
+>   on drift. Do not edit `src/` here by hand — the next sync would overwrite it.
+>
+> When both repositories go public, yu_ai_manager switches to a tag-pinned git
+> dependency on this one and the mirroring stops. This section goes away then.
 
 ## What it is
 
@@ -23,7 +36,7 @@ The host implements `LanCoworkHost`; this crate hands back
 `Router<LanCoworkState>` values that merge into the host's axum router. That
 seam is the whole contract — see `src/routes/lan_cowork_host.rs`.
 
-Two things deliberately stay on the host side and are therefore **not** in this
+Two files deliberately stay on the host side and are therefore **not** in this
 repository:
 
 - `impl LanCoworkHost for <HostState>` — Rust's orphan rule forbids it here.
@@ -32,39 +45,26 @@ repository:
 
 ## Reviewing this crate
 
-**Authorization is enforced in each route's body, not by a declaration.** There
-is no `require=` attribute to scan for — read the function. A route that looks
-unguarded from its signature may gate on `require_session`, on peer token
-verification, or on both; a route that looks guarded may be relying on the
-host's middleware for part of it.
+**Read [`docs/SECURITY_REVIEW.md`](docs/SECURITY_REVIEW.md) first.** It contains
+only what you cannot learn by reading the code here — the invariants that live
+across the crate boundary, the primitives that fail *open*, and the deviations
+that were known and accepted at separation time.
 
-Two properties are worth knowing before you read:
-
-- **Peer-to-peer traffic is plain HTTP.** Requests are signed and replay-guarded,
-  so they are authenticated and tamper-evident, but they are not confidential.
-  This is a deliberate choice for a LAN-local protocol, not an oversight.
-- **The nonce requirement is an allowlist** (`NONCE_REQUIRED_SUFFIXES` and
-  `NONCE_REQUIRED_PREFIXES` in `src/auth/peer_transport.rs`). A path that matches
-  neither is accepted without a nonce. When adding a route that mutates state,
-  add it to the allowlist too.
-
-Wire formats are pinned byte-for-byte by the vectors under `tests/vectors/`,
-which unit tests inside `src/` read with `include_str!`. **A failing vector test
-means the wire format changed** — which is almost never what you wanted.
+The one thing worth repeating outside that document: **authorization is enforced
+in each route's body, not by a declaration.** There is no `require=` attribute to
+scan for. Read the function.
 
 ## Building
 
 ```sh
-cargo test                                   # full suite (tests live in src/)
-cargo clippy --all-targets -- -D warnings    # what CI enforces
-cargo fmt --all -- --check
+cargo test
 ```
 
-Requires a system OpenSSL (`libssl-dev` and `pkg-config` on Debian/Ubuntu) —
-`openssl` supplies the CSPRNG bytes used for token and identity generation.
+Requires a system OpenSSL (`libssl-dev` on Debian/Ubuntu) — `openssl` is used
+for CSPRNG bytes in token and identity generation.
 
 Dependency versions are written out explicitly in `Cargo.toml` rather than
-inherited from a workspace.
+inherited from a workspace; they are pinned to match yu_ai_manager's workspace.
 
 ## License
 
