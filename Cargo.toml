@@ -4,12 +4,12 @@ version     = "0.1.0"
 edition     = "2021"
 license     = "MIT"
 description = "LAN peer pairing, fleet dispatch and cross-node cowork routes. Host-agnostic axum routes behind a LanCoworkHost trait."
-repository  = "https://github.com/habe358/yu-lan-cowork"
+repository  = "https://github.com/eauesque/yu-lan-cowork"
 
 # Dependency versions are pinned to match the yu_ai_manager workspace this crate
 # is developed in. They are written out explicitly here because a standalone
 # crate has no workspace to inherit from; keep them in step when either side
-# moves. `scripts/sync-from-yu-ai-manager.sh --check` reports drift.
+# moves.
 
 [dependencies]
 libc           = "0.2"

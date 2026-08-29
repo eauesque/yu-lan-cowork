@@ -134,6 +134,7 @@ pub async fn write_metadata(
     ratings: &Map<String, Value>,
     annotations: &Map<String, Value>,
     collections: &[Value],
+    merge_metadata: bool,
 ) -> Result<(), sqlx::Error> {
     let remote_id = remote_id.to_string();
     let now = now_secs();
@@ -177,12 +178,21 @@ pub async fn write_metadata(
         );
         query.push_bind(local_id).push(",");
         push_json_bind(&mut query, rating)?;
-        query
-            .push(",")
-            .push_bind(now)
-            .push(",")
-            .push_bind(now)
-            .push(") ON CONFLICT(file_id) DO UPDATE SET rating=excluded.rating,rated_at=excluded.rated_at,updated_at=excluded.updated_at");
+        // file_ratings is keyed on file_id alone, so a plain DO UPDATE replaces
+        // whatever the local user rated. That only happens on a path collision
+        // (re-import, or the scanner indexed the file first) -- a hash match
+        // never reaches here -- but on that path the local rating was lost with
+        // no trace. specs/2026-04-19-remote-import-design.md:212-213: local wins
+        // by default, merge_metadata takes the higher of the two.
+        //
+        // file_annotations needs no such split: its conflict key includes
+        // `source`, so a remote row can only replace a previous remote row.
+        query.push(",").push_bind(now).push(",").push_bind(now);
+        if merge_metadata {
+            query.push(") ON CONFLICT(file_id) DO UPDATE SET rating=MAX(file_ratings.rating,excluded.rating),rated_at=excluded.rated_at,updated_at=excluded.updated_at");
+        } else {
+            query.push(") ON CONFLICT(file_id) DO NOTHING");
+        }
         query.build().execute(&mut *conn).await?;
     }
 
@@ -287,6 +297,7 @@ pub async fn persist_downloaded_file(
     ratings: &Map<String, Value>,
     annotations: &Map<String, Value>,
     collections: &[Value],
+    merge_metadata: bool,
 ) -> Result<i64, sqlx::Error> {
     let local_id = insert_file(conn, path, peer_id, file_meta).await?;
     lan_cowork_import_state::register_file(
@@ -303,6 +314,7 @@ pub async fn persist_downloaded_file(
         ratings,
         annotations,
         collections,
+        merge_metadata,
     )
     .await?;
     Ok(local_id)
@@ -322,6 +334,7 @@ pub async fn persist_downloaded_file_standalone(
     ratings: &Map<String, Value>,
     annotations: &Map<String, Value>,
     collections: &[Value],
+    merge_metadata: bool,
 ) -> Result<i64, sqlx::Error> {
     let mut conn = pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
@@ -336,6 +349,7 @@ pub async fn persist_downloaded_file_standalone(
         ratings,
         annotations,
         collections,
+        merge_metadata,
     )
     .await;
     lan_cowork_import_state::finish_write(&mut conn, result).await
@@ -545,8 +559,60 @@ mod tests {
         .is_err());
     }
 
+    async fn rating_after_import(local: i64, remote: i64, merge_metadata: bool) -> i64 {
+        let pool = test_db().await;
+        let file_id = new_file(&pool, "/file").await;
+        sqlx::query(
+            "INSERT INTO file_ratings (file_id,rating,rated_at,updated_at) VALUES (?,?,0,0)",
+        )
+        .bind(file_id)
+        .bind(local)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ratings = serde_json::json!({ "7": remote })
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut conn = pool.acquire().await.unwrap();
+        write_metadata(
+            &mut conn,
+            "session",
+            "peer",
+            7,
+            file_id,
+            &Map::new(),
+            &ratings,
+            &Map::new(),
+            &[],
+            merge_metadata,
+        )
+        .await
+        .unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT rating FROM file_ratings WHERE file_id=?")
+            .bind(file_id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    /// Both directions: by default the remote value is ignored whether it is
+    /// higher or lower, so this cannot pass by accident on a MAX() rule.
     #[tokio::test]
-    async fn write_metadata_reuses_tags_skips_empty_and_overwrites_rating() {
+    async fn default_never_replaces_a_local_rating() {
+        assert_eq!(rating_after_import(4, 5, false).await, 4);
+        assert_eq!(rating_after_import(4, 1, false).await, 4);
+    }
+
+    /// "Merge" is not "replace": a lower remote value must not win either.
+    #[tokio::test]
+    async fn merge_metadata_takes_the_higher_rating() {
+        assert_eq!(rating_after_import(4, 5, true).await, 5);
+        assert_eq!(rating_after_import(4, 2, true).await, 4);
+    }
+
+    #[tokio::test]
+    async fn write_metadata_reuses_tags_skips_empty_and_keeps_the_local_rating() {
         let pool = test_db().await;
         let file_id = new_file(&pool, "/file").await;
         sqlx::query("INSERT INTO tags (tag,first_seen_mtime) VALUES ('old',0)")
@@ -576,6 +642,7 @@ mod tests {
             &ratings,
             &Map::new(),
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -588,13 +655,17 @@ mod tests {
             assert_eq!(row.try_get::<f64, _>("weight").unwrap(), 1.0);
             assert_eq!(row.try_get::<String, _>("source").unwrap(), "meta");
         }
+        // The local rating stands: file_ratings is keyed on file_id alone, so
+        // the old unconditional DO UPDATE replaced whatever the user had rated.
+        // specs/2026-04-19-remote-import-design.md:212-213 -- local wins by
+        // default, merge_metadata takes the higher.
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT rating FROM file_ratings WHERE file_id=?")
                 .bind(file_id)
                 .fetch_one(&mut *conn)
                 .await
                 .unwrap(),
-            4
+            2
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -637,6 +708,7 @@ mod tests {
             &Map::new(),
             &annotations,
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -654,6 +726,7 @@ mod tests {
             &Map::new(),
             &update,
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -671,6 +744,7 @@ mod tests {
             &Map::new(),
             &fallback,
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -727,6 +801,7 @@ mod tests {
             &Map::new(),
             &annotations,
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -764,6 +839,7 @@ mod tests {
             &Map::new(),
             &nested_annotations,
             &[],
+            false,
         )
         .await
         .is_err());
@@ -814,6 +890,7 @@ mod tests {
             &Map::new(),
             &Map::new(),
             &collections,
+            false,
         )
         .await
         .unwrap();
@@ -848,6 +925,7 @@ mod tests {
             &ratings,
             &Map::new(),
             &[],
+            false,
         )
         .await
         .is_err());

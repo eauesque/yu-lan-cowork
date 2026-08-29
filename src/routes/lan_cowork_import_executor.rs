@@ -14,7 +14,7 @@ use super::{
         claim_execution, is_file_processed, plan, register_file_standalone, update_standalone,
     },
     lan_cowork_import_transfer::{
-        download_file, download_zip, SessionDownloadBudget, SESSION_DOWNLOAD_LIMIT,
+        download_file, download_zip, SessionDownloadBudget, ZipChunk, SESSION_DOWNLOAD_LIMIT,
     },
     lan_cowork_registry::{PeerInfo, PeerRegistry},
 };
@@ -40,7 +40,7 @@ pub(crate) async fn run(
     peer: &PeerInfo,
     meta: &Map<String, Value>,
     import_folder: &Path,
-    _options: &Map<String, Value>,
+    options: &Map<String, Value>,
     local_peer_id: Option<&str>,
     seed: &[u8],
     registry: &PeerRegistry,
@@ -121,6 +121,13 @@ pub(crate) async fn run(
         }
     }
 
+    // The option was parsed into the session and then ignored (`_options`),
+    // which is why the rating overwrite went unnoticed: nothing read the switch
+    // that was meant to govern it.
+    let merge_metadata = options
+        .get("merge_metadata")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if uses_batch_zip(to_import.len()) {
         batch_zip(
             pool,
@@ -138,6 +145,7 @@ pub(crate) async fn run(
             registry,
             host,
             Some(&download_budget),
+            merge_metadata,
         )
         .await?;
     } else {
@@ -157,6 +165,7 @@ pub(crate) async fn run(
             registry,
             host,
             Some(&download_budget),
+            merge_metadata,
         )
         .await?;
     }
@@ -207,6 +216,7 @@ pub(crate) async fn individual_http(
     registry: &PeerRegistry,
     host: &dyn LanCoworkHost,
     download_budget: Option<&SessionDownloadBudget>,
+    merge_metadata: bool,
 ) -> Result<(), sqlx::Error> {
     for file_meta in to_import {
         // Intentional asymmetry: `plan` hard-fails malformed skip IDs; malformed import metadata
@@ -260,6 +270,7 @@ pub(crate) async fn individual_http(
             ratings,
             annotations,
             collections,
+            merge_metadata,
         )
         .await?;
     }
@@ -283,6 +294,7 @@ pub(crate) async fn batch_zip(
     registry: &PeerRegistry,
     host: &dyn LanCoworkHost,
     download_budget: Option<&SessionDownloadBudget>,
+    merge_metadata: bool,
 ) -> Result<(), sqlx::Error> {
     let mut ids_to_dl = Vec::new();
     let mut file_map_by_id = HashMap::new();
@@ -301,7 +313,7 @@ pub(crate) async fn batch_zip(
         }
     }
     for ids in ids_to_dl.chunks(ZIP_IDS_PER_REQUEST) {
-        let Some(downloaded) = download_zip(
+        let downloaded = match download_zip(
             peer,
             ids,
             import_folder,
@@ -312,34 +324,42 @@ pub(crate) async fn batch_zip(
             download_budget,
         )
         .await
-        else {
-            let chunk_meta: Vec<_> = ids
-                .iter()
-                .filter_map(|remote_id| {
-                    file_map_by_id
-                        .get(remote_id)
-                        .map(|meta| Value::Object((*meta).clone()))
-                })
-                .collect();
-            individual_http(
-                pool,
-                session_id,
-                peer_id,
-                peer,
-                &chunk_meta,
-                import_folder,
-                tags,
-                ratings,
-                annotations,
-                collections,
-                local_peer_id,
-                seed,
-                registry,
-                host,
-                download_budget,
-            )
-            .await?;
-            continue;
+        {
+            ZipChunk::Downloaded(downloaded) => downloaded,
+            // The peer refused our credentials. `download_zip` already
+            // invalidated the outbound token; retrying the remaining chunks
+            // would only repeat that refusal and re-emit the same SSE.
+            ZipChunk::Abort => return Ok(()),
+            ZipChunk::Degrade => {
+                let chunk_meta: Vec<_> = ids
+                    .iter()
+                    .filter_map(|remote_id| {
+                        file_map_by_id
+                            .get(remote_id)
+                            .map(|meta| Value::Object((*meta).clone()))
+                    })
+                    .collect();
+                individual_http(
+                    pool,
+                    session_id,
+                    peer_id,
+                    peer,
+                    &chunk_meta,
+                    import_folder,
+                    tags,
+                    ratings,
+                    annotations,
+                    collections,
+                    local_peer_id,
+                    seed,
+                    registry,
+                    host,
+                    download_budget,
+                    merge_metadata,
+                )
+                .await?;
+                continue;
+            }
         };
         let mut downloaded: Vec<_> = downloaded.into_iter().collect();
         downloaded.sort_unstable_by_key(|(remote_id, _)| *remote_id);
@@ -359,6 +379,7 @@ pub(crate) async fn batch_zip(
                 ratings,
                 annotations,
                 collections,
+                merge_metadata,
             )
             .await?;
         }
@@ -371,6 +392,7 @@ mod tests {
     use std::{fs, io::Write, sync::atomic::Ordering, time::Duration};
 
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
     use tempfile::tempdir;
     use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
@@ -480,6 +502,33 @@ mod tests {
             requests
         });
         (port, server)
+    }
+
+    /// Like `response_server_many`, but the caller reads what has been received
+    /// so far instead of joining the task. A test that pins "the batch stopped"
+    /// must be able to leave a response unconsumed without deadlocking, and
+    /// must not let an unconsumed response close the listener — a closed
+    /// listener turns a later request into a connection error, which looks the
+    /// same as never making the request at all.
+    async fn unjoined_response_server(
+        responses: Vec<Vec<u8>>,
+    ) -> (u16, Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            let mut responses = responses.into_iter();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let request = read_request(&mut stream).await;
+                let response = responses.next().unwrap_or_default();
+                let _ = stream.write_all(&response).await;
+                sink.lock().await.push(request);
+            }
+        });
+        (port, received)
     }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -854,6 +903,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -897,6 +947,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -940,6 +991,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -989,6 +1041,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1034,6 +1087,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1102,6 +1156,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1157,6 +1212,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1226,6 +1282,7 @@ mod tests {
                 &registry,
                 &*semantic_test_state(true).await,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -1244,17 +1301,26 @@ mod tests {
         TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
 
+    /// A non-OK chunk must be retried file by file. It used to be reported as
+    /// an empty archive, which the caller could not tell apart from "the peer
+    /// sent nothing", so the whole chunk was dropped without a single request
+    /// for its files.
     #[tokio::test]
-    async fn batch_zip_persists_before_a_later_non_success_chunk() {
+    async fn batch_zip_degrades_to_individual_http_on_a_non_ok_chunk() {
         let _guard = test_guard();
         TEST_ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
         let pool = test_pool().await;
         add_session(&pool, "session").await;
-        let (port, server) = response_server_many(vec![
+        let mut responses = vec![
             zip_response(&[("1/1.txt", b"one")]),
             b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(),
-        ])
-        .await;
+        ];
+        responses.extend(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                .to_vec();
+            ZIP_IDS_PER_REQUEST
+        ]);
+        let (port, server) = response_server_many(responses).await;
         let directory = tempdir().unwrap();
         let registry = PeerRegistry::new(pool.clone(), Duration::from_secs(30), "local".to_owned());
         batch_zip(
@@ -1273,6 +1339,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1281,9 +1348,14 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            1
+            1 + ZIP_IDS_PER_REQUEST as i64
         );
-        assert_eq!(server.await.unwrap().len(), 2);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), ZIP_IDS_PER_REQUEST + 2);
+        assert!(requests.iter().any(|request| {
+            String::from_utf8_lossy(request)
+                .starts_with("GET /ext/lan_cowork/api/peer/import/file/501 ")
+        }));
         TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
 
@@ -1330,6 +1402,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1343,16 +1416,22 @@ mod tests {
         TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
 
+    /// A 401 ends the batch. The loop used to carry on into every later chunk,
+    /// invalidating the outbound token — and emitting its SSE — once per chunk.
+    /// The third chunk is answered with a second 401 rather than left
+    /// unanswered, so that "never requested" cannot be confused with "requested
+    /// and the server was gone".
     #[tokio::test]
-    async fn batch_zip_keeps_prior_chunk_after_401() {
+    async fn batch_zip_stops_the_batch_after_401() {
         let _guard = test_guard();
         TEST_ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
         let pool = test_pool().await;
         add_session(&pool, "session").await;
-        let (port, server) = response_server_many(vec![
+        let unauthorized = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let (port, received) = unjoined_response_server(vec![
             zip_response(&[("1/1.txt", b"one")]),
-            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_vec(),
-            zip_response(&[]),
+            unauthorized.clone(),
+            unauthorized,
         ])
         .await;
         let directory = tempdir().unwrap();
@@ -1373,6 +1452,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1383,7 +1463,9 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(server.await.unwrap().len(), 3);
+        // Two chunk requests: the archive, then the 401 that ends the batch.
+        // The third chunk is never asked for.
+        assert_eq!(received.lock().await.len(), 2);
         TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
 
@@ -1408,6 +1490,7 @@ mod tests {
             &registry,
             &*semantic_test_state(true).await,
             None,
+            false,
         )
         .await
         .unwrap();

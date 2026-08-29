@@ -90,8 +90,17 @@ async fn fetch_allowlist(
     state: &LanCoworkState,
     registry: Arc<PeerRegistry>,
     peer: &PeerInfo,
+    seed: Option<Vec<u8>>,
 ) -> Result<(Value, StatusCode), ()> {
-    let seed = load_identity_seed(state.db_read()).await.ok_or(())?;
+    // The seed is one value per request, not per peer: reading it here made the
+    // SQLite reads scale with fleet size on every fan-out, where Python reads an
+    // in-memory `mgr.local_seed()` for free. It is read once in my_permissions
+    // and handed down.
+    //
+    // It stays an Option all the way here so a missing seed remains a per-peer
+    // `peer_unreachable` (pinned by missing_seed_is_per_peer_unreachable) rather
+    // than collapsing the whole request into a 500.
+    let seed = seed.ok_or(())?;
     let transport =
         PeerTransport::new(registry.local_peer_id(), seed, registry, state.host.clone());
     let mut headers = transport
@@ -119,12 +128,14 @@ async fn fetch_allowlist(
     Ok((body, status))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_one(
     state: LanCoworkState,
     registry: Arc<PeerRegistry>,
     peer: PeerInfo,
     bust: bool,
     now: Instant,
+    seed: Option<Vec<u8>>,
 ) -> Value {
     if !bust {
         if let Some(cached) = permission_cache()
@@ -145,12 +156,16 @@ async fn fetch_one(
         .acquire()
         .await
         .expect("process-global semaphore is never closed");
-    let (body, status) =
-        match tokio::time::timeout(OUTER_TIMEOUT, fetch_allowlist(&state, registry, &peer)).await {
-            Err(_) => return failed(&peer, "timeout"),
-            Ok(Err(())) => return failed(&peer, "peer_unreachable"),
-            Ok(Ok(result)) => result,
-        };
+    let (body, status) = match tokio::time::timeout(
+        OUTER_TIMEOUT,
+        fetch_allowlist(&state, registry, &peer, seed),
+    )
+    .await
+    {
+        Err(_) => return failed(&peer, "timeout"),
+        Ok(Err(())) => return failed(&peer, "peer_unreachable"),
+        Ok(Ok(result)) => result,
+    };
 
     let error = match status {
         StatusCode::CONFLICT => Some("no_pairing_token"),
@@ -211,11 +226,23 @@ async fn my_permissions(
         .collect::<Vec<_>>();
     let bust = query_has_bust(query.as_deref());
     let now = Instant::now();
-    let results = join_all(
-        peers
-            .into_iter()
-            .map(|peer| fetch_one(state.clone(), registry.clone(), peer, bust, now)),
-    )
+    // Once per request, before the fan-out. Skipped entirely when there is
+    // nobody to ask, so the empty case costs no read at all.
+    let seed = if peers.is_empty() {
+        None
+    } else {
+        load_identity_seed(state.db_read()).await
+    };
+    let results = join_all(peers.into_iter().map(|peer| {
+        fetch_one(
+            state.clone(),
+            registry.clone(),
+            peer,
+            bust,
+            now,
+            seed.clone(),
+        )
+    }))
     .await;
     log_query_complete(results.len());
     Json(json!({"ok": true, "peers": results})).into_response()

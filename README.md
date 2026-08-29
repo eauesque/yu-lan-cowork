@@ -1,25 +1,24 @@
 # yu-lan-cowork
 
 LAN peer pairing, fleet dispatch, and cross-node cowork routes — the part of
-[yu_ai_manager](https://github.com/habe358/yu_ai_manager) that talks to other
+[yu_ai_manager](https://github.com/eauesque/yu_ai_manager) that talks to other
 machines.
 
 It is a separate repository so that **it can be security-reviewed on its own.**
 Everything here handles peer identity, pairing secrets, tokens, and remote
 command dispatch; none of it needs the rest of the application to be understood.
 
-## Status: mirror, not yet the source of truth
+## Status: this repository is the source of truth
 
-> yu_ai_manager's Rust migration is still in progress, and neither repository is
-> public yet. Until both go public **together**:
->
-> - The source of truth is `crates/lan-cowork` inside yu_ai_manager.
-> - This repository is a mirror kept in step by
->   `scripts/sync-from-yu-ai-manager.sh`, which has a `--check` mode that fails
->   on drift. Do not edit `src/` here by hand — the next sync would overwrite it.
->
-> When both repositories go public, yu_ai_manager switches to a tag-pinned git
-> dependency on this one and the mirroring stops. This section goes away then.
+The crate used to live inside yu_ai_manager as `crates/lan-cowork` and was
+mirrored here. That is no longer so: on 2026-08-11 it moved out, and this
+repository is now where it is developed. yu_ai_manager consumes it as a
+rev-pinned git dependency.
+
+Development happens in a private repository and is squash-published here on
+each release, so the history is one commit per publish rather than per change.
+Consumers pin **this** repository, so a fresh clone or a CI runner builds it
+without credentials.
 
 ## What it is
 

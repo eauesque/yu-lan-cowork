@@ -29,6 +29,35 @@ const ZIP_ENTRY_COUNT_LIMIT: usize = 10_000;
 const ZIP_EXTRACT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 const ZIP_COMPRESSION_RATIO_LIMIT: u64 = 100;
 
+/// What the caller should do with a chunk after `download_zip` returns.
+///
+/// An `Option` could say only "use this map" or "fetch the chunk file by file",
+/// so every transport failure had to be spelled `Some(HashMap::new())` — a
+/// value the caller cannot tell apart from "the peer legitimately sent nothing".
+/// That is why a 414 or a 500 used to pass for a successful empty chunk.
+pub(crate) enum ZipChunk {
+    /// The archive arrived and expanded; the map holds what was extracted.
+    Downloaded(HashMap<i64, PathBuf>),
+    /// This chunk cannot be had as one archive. Fetch its files individually,
+    /// which registers a per-file failure for anything that stays missing.
+    Degrade,
+    /// The peer refused our credentials. Every later chunk would be refused
+    /// too, so the batch stops here instead of invalidating the token once per
+    /// chunk.
+    Abort,
+}
+
+#[cfg(test)]
+impl ZipChunk {
+    fn downloaded(self) -> HashMap<i64, PathBuf> {
+        match self {
+            ZipChunk::Downloaded(files) => files,
+            ZipChunk::Degrade => panic!("expected a downloaded chunk, got Degrade"),
+            ZipChunk::Abort => panic!("expected a downloaded chunk, got Abort"),
+        }
+    }
+}
+
 pub(crate) struct SessionDownloadBudget {
     pool: SqlitePool,
     session_id: String,
@@ -280,7 +309,7 @@ pub(crate) async fn download_zip(
     registry: &PeerRegistry,
     host: &dyn LanCoworkHost,
     download_budget: Option<&SessionDownloadBudget>,
-) -> Option<HashMap<i64, PathBuf>> {
+) -> ZipChunk {
     let full_path = "/ext/lan_cowork/api/peer/import/zip";
     let query_string = format!(
         "ids={}",
@@ -307,7 +336,7 @@ pub(crate) async fn download_zip(
         Ok(headers) => headers,
         Err(_) => {
             tracing::warn!(peer_id = %peer.peer_id, "could not build import ZIP headers");
-            return Some(HashMap::new());
+            return ZipChunk::Degrade;
         }
     };
     headers.insert(
@@ -325,7 +354,7 @@ pub(crate) async fn download_zip(
         Ok(client) => client,
         Err(_) => {
             tracing::warn!(peer_id = %peer.peer_id, "could not build import ZIP client");
-            return Some(HashMap::new());
+            return ZipChunk::Degrade;
         }
     };
     // The exact signed query string must also be the wire query string.
@@ -338,23 +367,23 @@ pub(crate) async fn download_zip(
         Ok(response) => response,
         Err(_) => {
             tracing::warn!(peer_id = %peer.peer_id, "import ZIP request failed");
-            return Some(HashMap::new());
+            return ZipChunk::Degrade;
         }
     };
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         invalidate_outbound_token(registry, host, &peer.peer_id).await;
-        return Some(HashMap::new());
+        return ZipChunk::Abort;
     }
     if response.status() != reqwest::StatusCode::OK {
         tracing::warn!(peer_id = %peer.peer_id, status = response.status().as_u16(), "import ZIP request returned non-OK status");
-        return Some(HashMap::new());
+        return ZipChunk::Degrade;
     }
 
     let mut file = match tempfile::tempfile() {
         Ok(file) => tokio::fs::File::from_std(file),
         Err(_) => {
             tracing::warn!(peer_id = %peer.peer_id, "could not create temporary import ZIP file");
-            return Some(HashMap::new());
+            return ZipChunk::Degrade;
         }
     };
     let mut bytes_written = 0u64;
@@ -362,25 +391,25 @@ pub(crate) async fn download_zip(
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else {
             tracing::warn!(peer_id = %peer.peer_id, bytes_written, "import ZIP download failed");
-            return Some(HashMap::new());
+            return ZipChunk::Degrade;
         };
         if bytes_written.saturating_add(chunk.len() as u64) > zip_download_limit() {
             tracing::warn!(peer_id = %peer.peer_id, bytes_written, limit = zip_download_limit(), "import ZIP download exceeded size limit");
-            return None;
+            return ZipChunk::Degrade;
         }
         if file.write_all(&chunk).await.is_err() {
             tracing::warn!(peer_id = %peer.peer_id, bytes_written, "import ZIP write failed");
-            return Some(HashMap::new());
+            return ZipChunk::Degrade;
         }
         bytes_written = bytes_written.saturating_add(chunk.len() as u64);
     }
     if file.flush().await.is_err() {
         tracing::warn!(peer_id = %peer.peer_id, bytes_written, "import ZIP write failed");
-        return Some(HashMap::new());
+        return ZipChunk::Degrade;
     }
     let file = file.into_std().await;
     let allowed_ids = remote_file_ids.iter().copied().collect::<HashSet<_>>();
-    let (file, expanded_size) = tokio::task::spawn_blocking(move || {
+    let inspected = tokio::task::spawn_blocking(move || {
         inspect_zip(
             file,
             &allowed_ids,
@@ -390,20 +419,24 @@ pub(crate) async fn download_zip(
             ZIP_COMPRESSION_RATIO_LIMIT,
         )
     })
-    .await
-    .ok()??;
+    .await;
+    let Ok(Some((file, expanded_size))) = inspected else {
+        tracing::warn!(peer_id = %peer.peer_id, "import ZIP failed inspection");
+        return ZipChunk::Degrade;
+    };
     if let Some(download_budget) = download_budget {
         if !download_budget.consume(expanded_size).await {
             tracing::warn!(peer_id = %peer.peer_id, "import session extraction exceeded size limit");
-            return None;
+            return ZipChunk::Degrade;
         }
     }
     let dest_folder = dest_folder.to_path_buf();
-    Some(
-        tokio::task::spawn_blocking(move || extract_zip(file, &dest_folder))
-            .await
-            .unwrap_or_default(),
-    )
+    let Ok(extracted) = tokio::task::spawn_blocking(move || extract_zip(file, &dest_folder)).await
+    else {
+        tracing::warn!(peer_id = %peer.peer_id, "import ZIP extraction task failed");
+        return ZipChunk::Degrade;
+    };
+    ZipChunk::Downloaded(extracted)
 }
 
 fn inspect_zip(
@@ -968,7 +1001,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(fs::read(&result.unwrap()[&1]).unwrap(), b"ok");
+        assert_eq!(fs::read(&result.downloaded()[&1]).unwrap(), b"ok");
         let request = String::from_utf8(server.await.unwrap()).unwrap();
         let request_lower = request.to_ascii_lowercase();
         assert!(request_lower
@@ -1017,19 +1050,20 @@ mod tests {
             .unwrap();
         let state = semantic_test_state(true).await;
         let mut events = state.sse_hub.subscribe();
-        assert!(download_zip(
-            &remote,
-            &[1],
-            tempdir().unwrap().path(),
-            None,
-            &[7; 32],
-            &registry,
-            &*state,
-            None,
-        )
-        .await
-        .unwrap()
-        .is_empty());
+        assert!(matches!(
+            download_zip(
+                &remote,
+                &[1],
+                tempdir().unwrap().path(),
+                None,
+                &[7; 32],
+                &registry,
+                &*state,
+                None,
+            )
+            .await,
+            ZipChunk::Abort
+        ));
         let updated = registry.get("remote").unwrap();
         assert_eq!(updated.token, None);
         assert_eq!(updated.token_expires_at, None);
@@ -1083,7 +1117,7 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap()[&1]
+                .downloaded()[&1]
             )
             .unwrap(),
             b"ok"
@@ -1094,7 +1128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_zip_returns_none_at_size_limit_plus_one() {
+    async fn download_zip_degrades_at_size_limit_plus_one() {
         let _guard = test_guard();
         TEST_ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
         let body = zip_bytes(&[("1/a.txt", b"ok")]);
@@ -1111,18 +1145,20 @@ mod tests {
             return;
         };
         let (registry, _) = registry().await;
-        assert!(download_zip(
-            &peer(port),
-            &[1],
-            tempdir().unwrap().path(),
-            None,
-            &[7; 32],
-            &registry,
-            &*semantic_test_state(true).await,
-            None,
-        )
-        .await
-        .is_none());
+        assert!(matches!(
+            download_zip(
+                &peer(port),
+                &[1],
+                tempdir().unwrap().path(),
+                None,
+                &[7; 32],
+                &registry,
+                &*semantic_test_state(true).await,
+                None,
+            )
+            .await,
+            ZipChunk::Degrade
+        ));
         server.await.unwrap();
         TEST_ZIP_DOWNLOAD_LIMIT.store(ZIP_DOWNLOAD_LIMIT, Ordering::Relaxed);
         TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);

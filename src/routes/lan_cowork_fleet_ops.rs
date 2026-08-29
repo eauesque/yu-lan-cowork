@@ -573,6 +573,30 @@ async fn fleet_update_status(
     if let Err(error) = fleet_peer_guard(&*state, registry, &method, &uri, &headers, &body).await {
         return error;
     }
+    // The record below carries the git commit SHA and every step's git output.
+    // Authentication alone -- any paired peer holding a token -- was the only
+    // gate, so an operator who had turned remote fleet operations off was still
+    // handing that record out.
+    //
+    // allow_remote_update is the master switch the UI advertises, and the
+    // consent flow persists it as true before an update runs, so gating on it
+    // cannot cut off a legitimate consent-driven poll. Whether the *allowlist*
+    // should apply here too is a separate decision, recorded in TODO.md: it
+    // would refuse a peer that reached the update through a consent token, and
+    // the job record carries no requester to exempt.
+    if !fleet_config(&*state)
+        .get("allow_remote_update")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return response(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "remote_update_disabled",
+                "message": "remote fleet operations are disabled on this node"
+            }),
+        );
+    }
 
     let query = Query::<HashMap<String, String>>::try_from_uri(&uri)
         .map(|Query(query)| query)
@@ -1177,6 +1201,26 @@ async fn fleet_logs_stream(
             Err(error) => return error,
         };
         let fleet = fleet_config(&*state);
+        // allow_remote_update first. Its name is historical -- the UI calls it
+        // "リモートからのアップデートを有効にする（マスタースイッチ）" and
+        // check_update_allowed treats it as the master switch for every fleet
+        // operation -- but this route used to read only the allowlist. An
+        // operator who unchecked the master switch was told remote fleet
+        // access was off while log streaming, which ships this node's ring
+        // buffer to a remote peer, kept working.
+        if !fleet
+            .get("allow_remote_update")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return response(
+                StatusCode::FORBIDDEN,
+                json!({
+                    "error": "remote_update_disabled",
+                    "message": "remote fleet operations are disabled on this node"
+                }),
+            );
+        }
         let allowed = parse_allowlist(
             fleet
                 .get("allow_log_stream_from")
@@ -1527,11 +1571,37 @@ mod tests {
         request
     }
 
+    /// These tests are about the job record, not about the master switch, which
+    /// is checked before any of it. Without this they would all read
+    /// remote_update_disabled and stop exercising what they name.
+    fn enable_remote_update(state: &SharedState) {
+        write_config_json(
+            &state.config.config_path,
+            &json!({"extensions":{"builtin-lan-cowork":{"fleet":{
+                "allow_remote_update": true,
+            }}}}),
+        )
+        .unwrap();
+    }
+
     fn configure_fleet(state: &SharedState, chief: bool, allow: &[&str]) {
+        configure_log_fleet(state, chief, allow, true);
+    }
+
+    /// `allow_remote_update` is the master switch the UI advertises, and log
+    /// streaming now sits under it. Allowlist tests want it on, so
+    /// `configure_fleet` keeps it on; only the master-switch test turns it off.
+    fn configure_log_fleet(
+        state: &SharedState,
+        chief: bool,
+        allow: &[&str],
+        allow_remote_update: bool,
+    ) {
         write_config_json(
             &state.config.config_path,
             &json!({"extensions":{"builtin-lan-cowork":{"fleet":{
                 "chief": chief,
+                "allow_remote_update": allow_remote_update,
                 "allow_log_stream_from": allow,
             }}}}),
         )
@@ -2748,12 +2818,57 @@ mod tests {
         );
     }
 
+    /// The record carries the git commit SHA and every step's git output. A
+    /// paired peer alone was enough to read it, even with remote fleet
+    /// operations switched off. The peer here is fully authenticated: only the
+    /// master switch may refuse it.
+    #[tokio::test]
+    async fn update_status_is_refused_while_remote_operations_are_off() {
+        let _guard = restart_test_guard();
+        reset_update_test_state();
+        let root = tempfile::tempdir().unwrap();
+        let (state, lc, token) = peer_state(true, root.path()).await;
+        let app = routes().with_state(lc.clone());
+
+        let refused = app
+            .clone()
+            .oneshot(signed_request(
+                "/ext/lan_cowork/fleet/update/status?job_id=x",
+                Some(&token),
+                "status-master-off",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_body(refused).await,
+            json!({
+                "error": "remote_update_disabled",
+                "message": "remote fleet operations are disabled on this node"
+            })
+        );
+
+        // Same peer, switch on: the refusal really was the switch. 404 here is
+        // the "no such job" answer, i.e. the handler ran.
+        enable_remote_update(&state);
+        let allowed = app
+            .oneshot(signed_request(
+                "/ext/lan_cowork/fleet/update/status?job_id=x",
+                Some(&token),
+                "status-master-on",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn update_status_validates_job_id_and_returns_active_job_without_heal() {
         let _guard = restart_test_guard();
         reset_update_test_state();
         let root = tempfile::tempdir().unwrap();
-        let (_state, lc, token) = peer_state(true, root.path()).await;
+        let (state, lc, token) = peer_state(true, root.path()).await;
+        enable_remote_update(&state);
         let app = routes().with_state(lc.clone());
         let response = app
             .clone()
@@ -2802,7 +2917,8 @@ mod tests {
     #[tokio::test]
     async fn disk_jobs_heal_only_on_matching_short_head() {
         let root = tempfile::tempdir().unwrap();
-        let (_state, lc, token) = peer_state(true, root.path()).await;
+        let (state, lc, token) = peer_state(true, root.path()).await;
+        enable_remote_update(&state);
         let app = routes().with_state(lc.clone());
         let root_path = root.path().to_path_buf();
 
@@ -2842,7 +2958,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_job_heals_and_writes_disk_before_404() {
         let root = tempfile::tempdir().unwrap();
-        let (_state, lc, token) = peer_state(true, root.path()).await;
+        let (state, lc, token) = peer_state(true, root.path()).await;
+        enable_remote_update(&state);
         write_job(
             root.path(),
             &json!({
@@ -2876,7 +2993,8 @@ mod tests {
     #[tokio::test]
     async fn disk_job_shapes_and_lowercase_status_are_preserved() {
         let root = tempfile::tempdir().unwrap();
-        let (_state, lc, token) = peer_state(true, root.path()).await;
+        let (state, lc, token) = peer_state(true, root.path()).await;
+        enable_remote_update(&state);
         let app = routes().with_state(lc.clone());
         for (index, job) in [
             json!({
@@ -3144,6 +3262,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (state, lc, token) = peer_state(true, root.path()).await;
         let app = routes().with_state(lc.clone());
+        // This test is about auth order, nonce replay and the allowlist. The
+        // master switch is checked before all of them, so leaving it at its
+        // default (off) would make every assertion below read
+        // remote_update_disabled and stop testing what it names.
+        configure_log_fleet(&state, false, &[], true);
         let mut unsigned = Request::builder()
             .uri("/ext/lan_cowork/fleet/logs/stream")
             .body(Body::empty())
@@ -3202,6 +3325,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The UI advertises `allow_remote_update` as a master switch and
+    /// `check_update_allowed` treats it as one. Log streaming ships this
+    /// node's ring buffer to a remote peer, so an operator who turns the
+    /// switch off and is still streamed from has been told something untrue.
+    /// The peer here is in the allowlist: only the master switch may refuse it.
+    #[tokio::test]
+    async fn log_stream_master_switch_off_refuses_an_allowlisted_peer() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, lc, token) = peer_state(true, root.path()).await;
+        let app = routes().with_state(lc.clone());
+
+        configure_log_fleet(&state, false, &["peer"], false);
+        let refused = app
+            .clone()
+            .oneshot(signed_request(
+                "/ext/lan_cowork/fleet/logs/stream",
+                Some(&token),
+                "peer-master-off",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_body(refused).await,
+            json!({
+                "error": "remote_update_disabled",
+                "message": "remote fleet operations are disabled on this node"
+            })
+        );
+
+        // Same peer, same allowlist, switch on: the refusal really was the
+        // switch and not something else about this request.
+        configure_log_fleet(&state, false, &["peer"], true);
+        let allowed = app
+            .oneshot(signed_request(
+                "/ext/lan_cowork/fleet/logs/stream",
+                Some(&token),
+                "peer-master-on",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 
     // The following 4 tests were relocated to yu-server's
