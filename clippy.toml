@@ -1,0 +1,7 @@
+# Route and auth helpers return `Result<T, axum::response::Response>` by design:
+# the Err *is* the HTTP response to send, and its status is part of the
+# Python-parity contract (see `require_peer_auth`). `Response` is 128 bytes, so
+# clippy 1.98's default `result_large_err` threshold flags every such helper.
+# Raise the bar just past `Response` rather than boxing 14 signatures — errors
+# genuinely larger than this are still reported.
+large-error-threshold = 192
