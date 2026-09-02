@@ -238,11 +238,21 @@ pub(crate) async fn individual_http(
         else {
             continue;
         };
+        // `size` is advisory in the metadata contract -- an entry without one
+        // is still importable -- so a missing or non-integer value means "no
+        // claim to check", not a rejection. A negative value is a claim we
+        // cannot honour, and is dropped rather than saturated to 0, which
+        // would demand an empty file.
+        let declared_size = file_meta
+            .get("size")
+            .and_then(Value::as_i64)
+            .and_then(|size| u64::try_from(size).ok());
         let Some(dest) = download_file(
             peer,
             remote_id,
             import_folder,
             original_name,
+            declared_size,
             local_peer_id,
             seed,
             registry,

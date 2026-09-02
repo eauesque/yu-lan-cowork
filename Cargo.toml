@@ -18,7 +18,13 @@ tokio          = { version = "1", features = ["full", "test-util"] }
 sqlx           = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
-reqwest        = { version = "0.12", default-features = false, features = ["json", "cookies", "stream", "rustls-tls"] }
+# `gzip`: an intermediary that compresses the import ZIP response would
+# otherwise hand us raw gzip bytes, the archive would fail to parse, and the
+# whole chunk would degrade to per-file downloads for no reason. Without the
+# feature reqwest neither advertises nor decodes it; with it, both. The Python
+# side has always decoded Content-Encoding (httpx does it by default), so this
+# also removes a behavioural split between the two implementations.
+reqwest        = { version = "0.12", default-features = false, features = ["json", "cookies", "stream", "rustls-tls", "gzip"] }
 url            = "2"
 thiserror      = "2"
 sha2           = "0.10"

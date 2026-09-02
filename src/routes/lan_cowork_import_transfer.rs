@@ -175,12 +175,19 @@ fn python_stem_and_suffix(name: &str) -> (&str, &str) {
     }
 }
 
+/// `declared_size` is the byte count the peer's import metadata claimed for
+/// this file, when it carried one. It is checked against what actually
+/// arrived: a body that stops short leaves a truncated image on disk that
+/// every later stage treats as a real file, and one that overruns means the
+/// metadata we sized the transfer against was not describing this file. The
+/// download cap catches neither -- it only bounds the total.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_file(
     peer: &PeerInfo,
     remote_file_id: i64,
     dest_folder: &Path,
     original_name: &str,
+    declared_size: Option<u64>,
     local_peer_id: Option<&str>,
     seed: &[u8],
     registry: &PeerRegistry,
@@ -285,6 +292,20 @@ pub(crate) async fn download_file(
                 tracing::warn!(peer_id = %peer.peer_id, bytes_written, limit = file_download_limit(), "import file download exceeded size limit");
                 return Err(());
             }
+            // Stop the moment the body overruns what the metadata declared,
+            // rather than writing the excess and comparing afterwards.
+            if let Some(declared) = declared_size {
+                if bytes_written.saturating_add(chunk.len() as u64) > declared {
+                    tracing::warn!(
+                        peer_id = %peer.peer_id,
+                        remote_file_id,
+                        declared,
+                        bytes_written,
+                        "import file body is larger than the size its metadata declared"
+                    );
+                    return Err(());
+                }
+            }
             file.write_all(&chunk).await.map_err(|_| ())?;
             bytes_written = bytes_written.saturating_add(chunk.len() as u64);
         }
@@ -295,6 +316,21 @@ pub(crate) async fn download_file(
         let _ = tokio::fs::remove_file(&dest).await;
         tracing::warn!(peer_id = %peer.peer_id, remote_file_id, bytes_written, "import file write failed");
         return None;
+    }
+    // A body that stopped short leaves a truncated file that every later stage
+    // treats as real, so a short read is a failure, not a partial success.
+    if let Some(declared) = declared_size {
+        if bytes_written != declared {
+            let _ = tokio::fs::remove_file(&dest).await;
+            tracing::warn!(
+                peer_id = %peer.peer_id,
+                remote_file_id,
+                declared,
+                bytes_written,
+                "import file size does not match the size its metadata declared"
+            );
+            return None;
+        }
     }
     Some(dest)
 }
@@ -454,7 +490,26 @@ fn inspect_zip(
     let mut expanded = 0u64;
     let mut remote_ids = HashSet::new();
     for index in 0..archive.len() {
-        let entry = archive.by_index(index).ok()?;
+        // Say why, rather than returning a bare None. This crate is built with
+        // `deflate` only, so a member using bzip2/lzma/zstd/xz/deflate64 is
+        // refused HERE -- `by_index` errors on a method it cannot read, before
+        // any check of ours sees the entry. Without this line the chunk simply
+        // degraded to per-file downloads with nothing recorded, which is the
+        // whole difficulty of the case: our peers always write Deflated, so
+        // another method means a non-conforming or hostile peer and the
+        // operator has no way to tell which.
+        let entry = match archive.by_index(index) {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    index,
+                    %error,
+                    "import ZIP entry could not be read (an unsupported \
+                     compression method reaches this arm)"
+                );
+                return None;
+            }
+        };
         if entry.is_dir() || entry.size() > member_limit {
             return None;
         }
@@ -475,7 +530,70 @@ fn inspect_zip(
             return None;
         }
     }
-    Some((archive.into_inner(), expanded))
+    let mut file = archive.into_inner();
+    // Re-open over the same handle: the comparison below needs the central
+    // directory (via an archive) and the raw local headers (via the file).
+    let mut reopened = zip::ZipArchive::new(file.try_clone().ok()?).ok()?;
+    if !zip_header_names_agree(&mut file, &mut reopened) {
+        return None;
+    }
+    Some((file, expanded))
+}
+
+/// Reject an archive whose local file headers disagree with its central
+/// directory about entry names.
+///
+/// Every check above -- the allow-list of remote ids, `validate_zip_entry_name`
+/// -- reads the CENTRAL DIRECTORY, because that is what `ZipArchive` exposes.
+/// A reader that extracted using the LOCAL header name instead would write to
+/// a path nothing validated. This crate does not do that, but a well-formed
+/// archive has no such disagreement and CPython's `zipfile` aborts on it, so
+/// accepting it would leave the two implementations disagreeing about the same
+/// bytes -- which is the asymmetry this check exists to close.
+///
+/// Parses the local headers directly: the crate reports only the central
+/// directory's view, so there is otherwise nothing to compare against.
+fn zip_header_names_agree(file: &mut fs::File, archive: &mut zip::ZipArchive<fs::File>) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    for index in 0..archive.len() {
+        let (central_name, offset) = match archive.by_index_raw(index) {
+            Ok(entry) => (entry.name().as_bytes().to_vec(), entry.header_start()),
+            Err(_) => return false,
+        };
+
+        // Local file header: signature(4) version(2) flags(2) method(2)
+        // time(2) date(2) crc(4) csize(4) size(4) namelen(2) extralen(2)
+        let mut header = [0u8; 30];
+        if file.seek(SeekFrom::Start(offset)).is_err() || file.read_exact(&mut header).is_err() {
+            return false;
+        }
+        if &header[0..4] != b"PK\x03\x04" {
+            return false;
+        }
+        let name_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
+        if name_len != central_name.len() {
+            tracing::warn!(
+                index,
+                central_len = central_name.len(),
+                local_len = name_len,
+                "import ZIP entry name length differs between local header and central directory"
+            );
+            return false;
+        }
+        let mut local_name = vec![0u8; name_len];
+        if file.read_exact(&mut local_name).is_err() {
+            return false;
+        }
+        if local_name != central_name {
+            tracing::warn!(
+                index,
+                "import ZIP entry name differs between local header and central directory"
+            );
+            return false;
+        }
+    }
+    true
 }
 
 fn extract_zip(file: fs::File, dest_folder: &Path) -> HashMap<i64, PathBuf> {
@@ -713,6 +831,7 @@ mod tests {
                 42,
                 &unresolved,
                 "a.txt",
+                None,
                 local_peer_id,
                 &seed,
                 &registry,
@@ -767,6 +886,7 @@ mod tests {
             directory.path(),
             "a.txt",
             None,
+            None,
             &[],
             &registry,
             &*semantic_test_state(true).await,
@@ -786,6 +906,7 @@ mod tests {
                 1,
                 directory.path(),
                 "a.txt",
+                None,
                 None,
                 &[7; 32],
                 &registry,
@@ -823,6 +944,7 @@ mod tests {
             1,
             tempdir().unwrap().path(),
             "a.txt",
+            None,
             None,
             &[7; 32],
             &registry,
@@ -866,6 +988,7 @@ mod tests {
             directory.path(),
             "../x",
             None,
+            None,
             &[7; 32],
             &registry,
             &*semantic_test_state(true).await,
@@ -894,6 +1017,7 @@ mod tests {
             1,
             directory.path(),
             "a.txt",
+            None,
             None,
             &[7; 32],
             &registry,
@@ -925,6 +1049,7 @@ mod tests {
                 1,
                 directory.path(),
                 "a.txt",
+                None,
                 None,
                 &[7; 32],
                 &registry,
@@ -958,6 +1083,7 @@ mod tests {
             directory.path(),
             "a.txt",
             None,
+            None,
             &[7; 32],
             &registry,
             &*semantic_test_state(true).await,
@@ -968,6 +1094,102 @@ mod tests {
         assert!(!directory.path().join("a.txt").exists());
         server.await.unwrap();
         TEST_FILE_DOWNLOAD_LIMIT.store(FILE_DOWNLOAD_LIMIT, Ordering::Relaxed);
+        TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
+    }
+
+    /// A body that disagrees with the size the metadata declared must not be
+    /// kept: a short read leaves a truncated image that every later stage
+    /// treats as a real file, and an overrun means the metadata we sized the
+    /// transfer against was describing something else.
+    ///
+    /// The download cap catches neither -- it only bounds the total -- so
+    /// without this the mismatch reached the library silently.
+    #[tokio::test]
+    async fn download_file_rejects_a_body_that_disagrees_with_the_declared_size() {
+        for (declared, body) in [
+            (Some(16u64), b"short".as_slice()),       // stops early
+            (Some(2u64), b"far too long".as_slice()), // overruns
+        ] {
+            let _guard = test_guard();
+            TEST_ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+            let Some((port, server)) = response_server(
+                [
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                        .into_bytes(),
+                    body.to_vec(),
+                ]
+                .concat(),
+            )
+            .await
+            else {
+                return;
+            };
+            let (registry, _) = registry().await;
+            let directory = tempdir().unwrap();
+            let result = download_file(
+                &peer(port),
+                1,
+                directory.path(),
+                "a.txt",
+                declared,
+                None,
+                &[7; 32],
+                &registry,
+                &*semantic_test_state(true).await,
+                None,
+            )
+            .await;
+            let _ = server.await;
+            assert!(
+                result.is_none(),
+                "declared {declared:?} but the body was {} bytes",
+                body.len()
+            );
+            // Nothing may be left behind for a later stage to pick up.
+            assert!(
+                fs::read_dir(directory.path()).unwrap().next().is_none(),
+                "a rejected download must not leave a file on disk"
+            );
+            TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// The control for the test above: a body that matches must still be kept,
+    /// or "reject everything" would satisfy it.
+    #[tokio::test]
+    async fn download_file_keeps_a_body_matching_the_declared_size() {
+        let _guard = test_guard();
+        TEST_ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+        let body = b"exactly-this".as_slice();
+        let Some((port, server)) = response_server(
+            [
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes(),
+                body.to_vec(),
+            ]
+            .concat(),
+        )
+        .await
+        else {
+            return;
+        };
+        let (registry, _) = registry().await;
+        let directory = tempdir().unwrap();
+        let result = download_file(
+            &peer(port),
+            1,
+            directory.path(),
+            "a.txt",
+            Some(body.len() as u64),
+            None,
+            &[7; 32],
+            &registry,
+            &*semantic_test_state(true).await,
+            None,
+        )
+        .await;
+        let _ = server.await;
+        let path = result.expect("a body matching its declared size must be kept");
+        assert_eq!(fs::read(&path).unwrap(), body);
         TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
 
@@ -1265,6 +1487,95 @@ mod tests {
             )
             .is_none());
         }
+    }
+
+    /// A well-formed archive must still pass, or the three rejections below
+    /// would be satisfied by `inspect_zip` refusing everything.
+    #[test]
+    fn inspect_zip_accepts_a_well_formed_archive() {
+        let allowed = HashSet::from([1, 2]);
+        let bytes = zip_bytes(&[
+            ("1/a.txt", b"aaaa".as_slice()),
+            ("2/b.txt", b"bb".as_slice()),
+        ]);
+        let inspected = inspect_zip(zip_file(&bytes), &allowed, 10, 4096, 4096, 100);
+        let (_, expanded) = inspected.expect("a conforming archive must be accepted");
+        assert_eq!(
+            expanded, 6,
+            "expanded size should be the sum of member sizes"
+        );
+    }
+
+    /// A member this build cannot decompress must be refused during
+    /// inspection, not during extraction.
+    ///
+    /// The rejection comes from `ZipArchive::by_index` itself: the crate is
+    /// built with `deflate` only and errors on any other method before
+    /// returning an entry. An explicit `match entry.compression()` check was
+    /// written first and removed again -- fault injection showed this test
+    /// stayed green with that check disabled, i.e. it was unreachable. What
+    /// the code needed was not another guard but a reason in the log, since
+    /// the chunk otherwise degraded to per-file downloads silently.
+    #[test]
+    fn inspect_zip_rejects_a_compression_method_this_build_cannot_read() {
+        // The method byte is rewritten rather than asking `ZipWriter` for
+        // bzip2: that would need the crate's `bzip2` feature, i.e. adding a
+        // codec to production just to write a fixture. 12 = bzip2 in the PKZIP
+        // method registry.
+        const BZIP2: u16 = 12;
+        let mut bytes = zip_bytes(&[("1/a.txt", b"payload".as_slice())]);
+        for signature in [b"PK\x03\x04".as_slice(), b"PK\x01\x02".as_slice()] {
+            let at = bytes
+                .windows(4)
+                .position(|part| part == signature)
+                .expect("header present");
+            // method sits at +8 in the local header, +10 in the central one.
+            let offset = at + if signature == b"PK\x03\x04" { 8 } else { 10 };
+            bytes[offset..offset + 2].copy_from_slice(&BZIP2.to_le_bytes());
+        }
+
+        // Establish WHERE the rejection happens before asserting that it does.
+        // Removing the explicit method check below still left this test green,
+        // which means something earlier refuses the entry: the crate errors
+        // from `by_index` for a method it was not built to read, rather than
+        // returning an entry that fails later during extraction.
+        let mut archive = zip::ZipArchive::new(zip_file(&bytes)).expect("archive opens");
+        assert!(
+            archive.by_index(0).is_err(),
+            "this test's premise is that the crate itself refuses the entry; if it \
+             now returns one, the explicit method check is what must reject it"
+        );
+
+        let allowed = HashSet::from([1]);
+        assert!(
+            inspect_zip(zip_file(&bytes), &allowed, 10, 4096, 4096, 100).is_none(),
+            "a member compressed with an unreadable method must be rejected during inspection"
+        );
+    }
+
+    #[test]
+    fn inspect_zip_rejects_local_header_name_disagreeing_with_the_central_directory() {
+        // Every other check reads the central directory. Rewrite only the
+        // LOCAL header's name so the two disagree: a reader that extracted by
+        // the local name would use a path nothing validated, and CPython's
+        // zipfile aborts on such an archive.
+        let mut bytes = zip_bytes(&[("1/a.txt", b"payload".as_slice())]);
+        let local = bytes
+            .windows(4)
+            .position(|part| part == b"PK\x03\x04")
+            .expect("local file header");
+        let name_len = usize::from(u16::from_le_bytes([bytes[local + 26], bytes[local + 27]]));
+        assert_eq!(name_len, "1/a.txt".len());
+        let name_at = local + 30;
+        // Same length, different bytes -- so only the name comparison can
+        // catch it, not a length check or a CRC.
+        bytes[name_at..name_at + name_len].copy_from_slice(b"1/z.txt");
+
+        let allowed = HashSet::from([1]);
+        assert!(
+            inspect_zip(zip_file(&bytes), &allowed, 10, 4096, 4096, 100).is_none(),
+            "a local/central name mismatch must be rejected"
+        );
     }
 
     #[test]
