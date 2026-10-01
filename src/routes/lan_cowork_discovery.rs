@@ -337,6 +337,11 @@ fn dict_strings(dict: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Missing fields preserve runtime state; present non-arrays explicitly clear it.
+fn dict_strings_opt(dict: &Value, key: &str) -> Option<Vec<String>> {
+    dict.get(key).map(|_| dict_strings(dict, key))
+}
+
 /// TOFU-process one received HELLO. See the module/plan MF-11 notes.
 pub async fn handle_hello(
     registry: &PeerRegistry,
@@ -358,12 +363,13 @@ pub async fn handle_hello(
         if !verified {
             return HelloOutcome::VerifyFailed;
         }
+        let inference_types = dict_strings_opt(&parsed.peer_dict, "inference_types");
         registry.update_runtime(
             &existing.peer_id,
             None,
             None,
             None,
-            None,
+            inference_types.clone(),
             Some(now as f64),
             Some("online".to_string()),
         );
@@ -371,13 +377,16 @@ pub async fn handle_hello(
         if existing.api_host != addr || existing.x25519_pk != Some(parsed.x25519_pk) {
             // `existing` is a pre-update clone (get_by_pubkey returns .cloned()), so it
             // still holds the STALE runtime. update_runtime already wrote status=online
-            // / last_seen=now to the live entry; carry those into the upsert clone too,
+            // / last_seen=now and inference_types to the live entry; carry those into the clone,
             // or the peers.insert() inside upsert would roll them back (MF-8, offline flap).
             let mut updated = existing.clone();
             updated.api_host = addr.to_string();
             updated.x25519_pk = Some(parsed.x25519_pk);
             updated.last_seen = now as f64;
             updated.status = "online".to_string();
+            if let Some(inference_types) = inference_types {
+                updated.inference_types = inference_types;
+            }
             let _ = registry.upsert(updated).await;
         }
         return HelloOutcome::KnownUpdated;
@@ -543,6 +552,31 @@ mod tests {
         parse_hello_packet(&bytes).unwrap()
     }
 
+    /// Re-sign the actual wire dict to exercise omitted and malformed capabilities.
+    fn signed_inference_types(value: Option<Value>, ts: u64) -> ParsedHello {
+        let mut parsed = signed(SEED_A, 8188, ts);
+        match value {
+            Some(value) => parsed.peer_dict["inference_types"] = value,
+            None => {
+                parsed
+                    .peer_dict
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("inference_types");
+            }
+        }
+        let json = serde_json::to_vec(&parsed.peer_dict).unwrap();
+        let mut packet = parsed.raw_signed[..8].to_vec();
+        packet.extend_from_slice(&(json.len() as u32).to_be_bytes());
+        packet.extend_from_slice(&json);
+        packet.extend_from_slice(&ts.to_be_bytes());
+        let signature = crate::auth::peer_transport::sign_canonical(SEED_A, &packet).unwrap();
+        packet.extend_from_slice(&signature);
+        let parsed = parse_hello_packet(&packet).unwrap();
+        assert!(verify_hello(&parsed, &ed25519_pub(SEED_A), ts));
+        parsed
+    }
+
     /// Build an UNSIGNED HELLO (valid structure, no signature).
     fn unsigned(seed: &[u8], api_port: u16, ts: u64) -> ParsedHello {
         let mut info = peer_info(seed, api_port);
@@ -593,6 +627,132 @@ mod tests {
         assert_eq!(hello.inference_types, peer.inference_types);
         assert_eq!(hello.pubkey, None);
         assert_eq!(hello.x25519_pk, None);
+    }
+
+    #[tokio::test]
+    async fn assemble_and_hello_advertise_host_inference_types() {
+        use crate::routes::lan_cowork_descriptor::{
+            reset_client_state, LocalDescriptor, TEST_DESCRIPTOR,
+        };
+        use crate::routes::lan_cowork_host::{LanCoworkHost, LogEvent, LogLine};
+        use crate::test_support::TestHost;
+        use std::{path::Path, time::Instant};
+
+        struct TaggerHost(TestHost);
+
+        #[async_trait::async_trait]
+        impl LanCoworkHost for TaggerHost {
+            fn advertised_inference_types(&self) -> Vec<String> {
+                vec!["tagger".into()]
+            }
+            fn db(&self) -> &sqlx::SqlitePool {
+                self.0.db()
+            }
+            fn db_read(&self) -> &sqlx::SqlitePool {
+                self.0.db_read()
+            }
+            fn python_client(&self) -> &reqwest::Client {
+                self.0.python_client()
+            }
+            fn version(&self) -> &str {
+                self.0.version()
+            }
+            fn start_time(&self) -> Instant {
+                self.0.start_time()
+            }
+            fn config_json(&self) -> &Value {
+                self.0.config_json()
+            }
+            fn config_path(&self) -> &Path {
+                self.0.config_path()
+            }
+            fn project_root(&self) -> &Path {
+                self.0.project_root()
+            }
+            fn python_url(&self) -> &str {
+                self.0.python_url()
+            }
+            fn pin_auth_enabled(&self) -> bool {
+                self.0.pin_auth_enabled()
+            }
+            fn safe_mode(&self) -> bool {
+                self.0.safe_mode()
+            }
+            fn sse_send(&self, source: &str, kind: &str, timestamp: f64, payload: Value) {
+                self.0.sse_send(source, kind, timestamp, payload);
+            }
+            fn sse_receiver_count(&self) -> usize {
+                self.0.sse_receiver_count()
+            }
+            fn render_nav(&self, csp_nonce: &str, active: &str) -> String {
+                self.0.render_nav(csp_nonce, active)
+            }
+            fn log_open(
+                &self,
+                limit: usize,
+                level: Option<&str>,
+            ) -> (
+                futures_util::stream::BoxStream<'static, LogEvent>,
+                Vec<LogLine>,
+            ) {
+                self.0.log_open(limit, level)
+            }
+            fn register_log_stream_connection(&self, ip: &str) -> bool {
+                self.0.register_log_stream_connection(ip)
+            }
+            fn unregister_log_stream_connection(&self, ip: &str) {
+                self.0.unregister_log_stream_connection(ip);
+            }
+            async fn record_journal_action(
+                &self,
+                session_id: &str,
+                tool_name: &str,
+                status: &str,
+                duration_ms: i64,
+                result_summary: &str,
+            ) {
+                self.0
+                    .record_journal_action(
+                        session_id,
+                        tool_name,
+                        status,
+                        duration_ms,
+                        result_summary,
+                    )
+                    .await;
+            }
+            async fn require_session(
+                &self,
+                session: Option<&tower_sessions::Session>,
+            ) -> Option<axum::response::Response> {
+                self.0.require_session(session).await
+            }
+        }
+
+        let _guard = test_guard();
+        reset_client_state();
+        let host = TaggerHost(TestHost::new(false, false, String::new(), ".".into()));
+        crate::schema::apply_standalone_schema(host.db())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO lan_cowork_identity (key, value) VALUES ('ed25519_seed', ?)")
+            .bind(SEED_A)
+            .execute(host.db())
+            .await
+            .unwrap();
+        *TEST_DESCRIPTOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(LocalDescriptor {
+            peer_id: "ignored".into(),
+            name: "self".into(),
+            api_host: "10.0.0.1".into(),
+            api_port: 8188,
+            version: String::new(),
+            bridges: vec![],
+        }));
+        let peer = assemble_local_peer_info(&host).await;
+        reset_client_state();
+        let peer = peer.unwrap();
+        assert_eq!(peer.inference_types, ["tagger"]);
+        assert_eq!(hello_info_from_peer(&peer).inference_types, ["tagger"]);
     }
 
     #[test]
@@ -862,6 +1022,122 @@ mod tests {
         assert_eq!(stored.api_host, "10.0.0.9");
         assert_eq!(stored.status, "online"); // not rolled back to the stale offline clone
         assert_eq!(stored.last_seen, (NOW + 1) as f64);
+    }
+
+    #[tokio::test]
+    async fn known_peer_refreshes_inference_types() {
+        let reg = registry().await;
+        let pid = seed_peer_id(SEED_A);
+        assert_eq!(
+            handle_hello(&reg, &signed(SEED_A, 8188, NOW), "10.0.0.5", NOW).await,
+            HelloOutcome::NewRegistered
+        );
+        assert!(reg.get(&pid).unwrap().inference_types.is_empty());
+        let hello = signed_inference_types(Some(serde_json::json!(["tagger"])), NOW + 1);
+        assert_eq!(
+            handle_hello(&reg, &hello, "10.0.0.5", NOW + 1).await,
+            HelloOutcome::KnownUpdated
+        );
+        assert_eq!(reg.get(&pid).unwrap().inference_types, ["tagger"]);
+    }
+
+    #[tokio::test]
+    async fn known_peer_keeps_refreshed_inference_types_on_new_ip() {
+        let reg = registry().await;
+        handle_hello(&reg, &signed(SEED_A, 8188, NOW), "10.0.0.5", NOW).await;
+        let hello = signed_inference_types(Some(serde_json::json!(["tagger"])), NOW + 1);
+        assert_eq!(
+            handle_hello(&reg, &hello, "10.0.0.9", NOW + 1).await,
+            HelloOutcome::KnownUpdated
+        );
+        let stored = reg.get(&seed_peer_id(SEED_A)).unwrap();
+        assert_eq!(stored.inference_types, ["tagger"]);
+        assert_eq!(stored.api_host, "10.0.0.9");
+    }
+
+    #[tokio::test]
+    async fn known_peer_preserves_absent_inference_types() {
+        let reg = registry().await;
+        let hello = signed_inference_types(Some(serde_json::json!(["tagger"])), NOW);
+        handle_hello(&reg, &hello, "10.0.0.5", NOW).await;
+        for (offset, ip) in [(1, "10.0.0.5"), (2, "10.0.0.9")] {
+            let hello = signed_inference_types(None, NOW + offset);
+            assert_eq!(
+                handle_hello(&reg, &hello, ip, NOW + offset).await,
+                HelloOutcome::KnownUpdated
+            );
+            assert_eq!(
+                reg.get(&seed_peer_id(SEED_A)).unwrap().inference_types,
+                ["tagger"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_peer_clears_malformed_inference_types() {
+        for value in [
+            serde_json::json!("tagger"),
+            Value::Null,
+            serde_json::json!(1),
+            serde_json::json!({}),
+            serde_json::json!(true),
+            serde_json::json!([]),
+        ] {
+            let reg = registry().await;
+            let hello = signed_inference_types(Some(serde_json::json!(["tagger"])), NOW);
+            handle_hello(&reg, &hello, "10.0.0.5", NOW).await;
+            assert_eq!(
+                reg.get(&seed_peer_id(SEED_A)).unwrap().inference_types,
+                ["tagger"]
+            );
+            let hello = signed_inference_types(Some(value.clone()), NOW + 1);
+            assert_eq!(
+                handle_hello(&reg, &hello, "10.0.0.5", NOW + 1).await,
+                HelloOutcome::KnownUpdated
+            );
+            assert!(
+                reg.get(&seed_peer_id(SEED_A))
+                    .unwrap()
+                    .inference_types
+                    .is_empty(),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_peer_filters_inference_types_array() {
+        let reg = registry().await;
+        handle_hello(&reg, &signed(SEED_A, 8188, NOW), "10.0.0.5", NOW).await;
+        let hello = signed_inference_types(Some(serde_json::json!(["tagger", 1])), NOW + 1);
+        assert_eq!(
+            handle_hello(&reg, &hello, "10.0.0.5", NOW + 1).await,
+            HelloOutcome::KnownUpdated
+        );
+        assert_eq!(
+            reg.get(&seed_peer_id(SEED_A)).unwrap().inference_types,
+            ["tagger"]
+        );
+    }
+
+    #[tokio::test]
+    async fn known_peer_restores_inference_types_after_load_all() {
+        let reg = registry().await;
+        let pid = seed_peer_id(SEED_A);
+        let hello = signed_inference_types(Some(serde_json::json!(["tagger"])), NOW);
+        assert_eq!(
+            handle_hello(&reg, &hello, "10.0.0.5", NOW).await,
+            HelloOutcome::NewRegistered
+        );
+        assert_eq!(reg.get(&pid).unwrap().inference_types, ["tagger"]);
+        reg.load_all(0, 0, (NOW + 1) as f64).await.unwrap();
+        assert!(reg.get(&pid).unwrap().inference_types.is_empty());
+        let hello = signed_inference_types(Some(serde_json::json!(["tagger"])), NOW + 1);
+        assert_eq!(
+            handle_hello(&reg, &hello, "10.0.0.5", NOW + 1).await,
+            HelloOutcome::KnownUpdated
+        );
+        assert_eq!(reg.get(&pid).unwrap().inference_types, ["tagger"]);
     }
 
     #[tokio::test]

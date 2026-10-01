@@ -38,6 +38,10 @@ pub trait LanCoworkHost: Send + Sync + 'static {
     fn db_read(&self) -> &SqlitePool;
     fn python_client(&self) -> &reqwest::Client;
     fn version(&self) -> &str;
+    /// Host-selected inference capabilities advertised in HELLO / peer status; none by default.
+    fn advertised_inference_types(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn start_time(&self) -> Instant;
     fn config_json(&self) -> &serde_json::Value;
     fn config_path(&self) -> &Path;
@@ -139,6 +143,12 @@ impl LanCoworkState {
 mod tests {
     use super::*;
     use crate::test_support::TestHost;
+
+    #[tokio::test]
+    async fn advertised_inference_types_defaults_to_empty() {
+        let host = TestHost::new(false, false, String::new(), ".".into());
+        assert!(host.advertised_inference_types().is_empty());
+    }
 
     #[tokio::test]
     async fn lan_cowork_state_new_shares_caller_supplied_arc_identity() {

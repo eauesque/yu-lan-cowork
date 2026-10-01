@@ -69,7 +69,7 @@ pub async fn assemble_local_peer_info(state: &dyn LanCoworkHost) -> Option<PeerI
         x25519_pk: Some(x25519_pk),
         version: state.version().to_owned(),
         bridges: descriptor.bridges,
-        inference_types: vec![],
+        inference_types: state.advertised_inference_types(),
         gpu: String::new(),
         generating: false,
         queue_depth: 0,
