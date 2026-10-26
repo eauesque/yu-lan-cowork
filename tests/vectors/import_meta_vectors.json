@@ -63,7 +63,8 @@
       "collections": [
         {
           "id": 9,
-          "name": "fixture set"
+          "name": "fixture set",
+          "file_ids": []
         }
       ],
       "file_ratings": {

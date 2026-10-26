@@ -115,7 +115,7 @@ pub(crate) enum ZipEntryNameError {
 
 pub(crate) fn unique_dest(folder: &Path, name: &str) -> PathBuf {
     let dest = folder.join(name);
-    if !dest.exists() {
+    if dest.symlink_metadata().is_err() {
         return dest;
     }
 
@@ -126,11 +126,32 @@ pub(crate) fn unique_dest(folder: &Path, name: &str) -> PathBuf {
     let (stem, suffix) = python_stem_and_suffix(file_name);
     for index in 1.. {
         let candidate = folder.join(format!("{stem}_{index}{suffix}"));
-        if !candidate.exists() {
+        if candidate.symlink_metadata().is_err() {
             return candidate;
         }
     }
     unreachable!()
+}
+
+fn create_unique_dest(folder: &Path, name: &str) -> std::io::Result<(PathBuf, fs::File)> {
+    loop {
+        let dest = unique_dest(folder, name);
+        if !verify_within(&dest, folder) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "import destination escaped folder",
+            ));
+        }
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+        {
+            Ok(file) => return Ok((dest, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub(crate) fn validate_zip_entry_name(name: &str) -> Result<(), ZipEntryNameError> {
@@ -265,20 +286,20 @@ pub(crate) async fn download_file(
         );
         return None;
     }
-    let dest = unique_dest(dest_folder, original_name);
+    let dest = dest_folder.join(original_name);
     let parent = dest.parent()?;
     if tokio::fs::create_dir_all(parent).await.is_err() {
         tracing::warn!(peer_id = %peer.peer_id, remote_file_id, dest_folder = %dest_folder.display(), "could not create import destination directory");
         return None;
     }
-    if !verify_within(&dest, dest_folder) {
-        tracing::warn!(peer_id = %peer.peer_id, remote_file_id, dest_folder = %dest_folder.display(), "import destination escaped destination folder");
+    let Ok((dest, file)) = create_unique_dest(dest_folder, original_name) else {
+        tracing::warn!(peer_id = %peer.peer_id, remote_file_id, dest_folder = %dest_folder.display(), "could not reserve import destination");
         return None;
-    }
+    };
 
     let mut bytes_written = 0u64;
     let write_result = async {
-        let mut file = tokio::fs::File::create(&dest).await.map_err(|_| ())?;
+        let mut file = tokio::fs::File::from_std(file);
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| ())?;
@@ -606,7 +627,6 @@ fn extract_zip(file: fs::File, dest_folder: &Path) -> HashMap<i64, PathBuf> {
     };
     let entry_count = archive.len();
 
-    // Keep extraction sequential: unique_dest has a check/create TOCTOU window.
     for index in 0..entry_count {
         let Ok(mut entry) = archive.by_index(index) else {
             tracing::warn!(entry_count, "could not read import ZIP entry");
@@ -636,7 +656,7 @@ fn extract_zip(file: fs::File, dest_folder: &Path) -> HashMap<i64, PathBuf> {
             break;
         }
         // Do not flatten fname: its nested components are part of the Python contract.
-        let dest = unique_dest(dest_folder, fname);
+        let dest = dest_folder.join(fname);
         let Some(parent) = dest.parent() else {
             failed = true;
             break;
@@ -651,7 +671,7 @@ fn extract_zip(file: fs::File, dest_folder: &Path) -> HashMap<i64, PathBuf> {
             failed = true;
             break;
         }
-        let Ok(mut output) = fs::File::create(&dest) else {
+        let Ok((dest, mut output)) = create_unique_dest(dest_folder, fname) else {
             tracing::warn!(
                 remote_id = rid,
                 fname_len = fname.len(),
@@ -1664,6 +1684,42 @@ mod tests {
             unique_dest(&nested_folder, "sub/a.txt"),
             nested_folder.join("a_1.txt")
         );
+    }
+
+    #[test]
+    fn concurrent_destinations_are_exclusive_and_keep_each_payload() {
+        let directory = tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let paths = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8u8)
+                .map(|value| {
+                    let folder = directory.path();
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        use std::io::Write;
+                        barrier.wait();
+                        let (path, mut file) = create_unique_dest(folder, "same.txt").unwrap();
+                        file.write_all(&[value]).unwrap();
+                        (path, value)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            paths
+                .iter()
+                .map(|(path, _)| path)
+                .collect::<HashSet<_>>()
+                .len(),
+            8
+        );
+        for (path, value) in paths {
+            assert_eq!(fs::read(path).unwrap(), [value]);
+        }
     }
 
     #[test]

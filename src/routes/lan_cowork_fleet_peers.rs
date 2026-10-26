@@ -414,7 +414,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
-        auth::peer_transport::verify_request_signature,
+        auth::peer_transport::verify_request_signature_with_nonce,
         routes::{
             lan_cowork::write_config_json,
             lan_cowork_descriptor::{reset_client_state, test_guard, TEST_ALLOW_LOOPBACK},
@@ -997,7 +997,7 @@ mod tests {
         assert_eq!(request.headers["X-Requested-With"], requested_with);
         assert!(request.headers.contains_key(header::AUTHORIZATION));
         let key = PKey::private_key_from_raw_bytes(&TEST_SEED, Id::ED25519).unwrap();
-        assert!(verify_request_signature(
+        assert!(verify_request_signature_with_nonce(
             &key.raw_public_key().unwrap(),
             request.method.as_str(),
             expected_path,
@@ -1005,6 +1005,7 @@ mod tests {
             &request.body,
             request.headers["X-Peer-Ts"].to_str().unwrap(),
             request.headers["X-Peer-Sig"].to_str().unwrap(),
+            request.headers["X-Peer-Nonce"].to_str().unwrap(),
         ));
     }
 

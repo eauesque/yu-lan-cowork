@@ -32,6 +32,7 @@ pub enum LogEvent {
     Closed,
 }
 
+#[allow(clippy::double_must_use)] // async_trait generates must_use on an already must_use Future.
 #[async_trait]
 pub trait LanCoworkHost: Send + Sync + 'static {
     fn db(&self) -> &SqlitePool;

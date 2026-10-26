@@ -188,11 +188,16 @@ pub async fn query_tags(
 }
 
 pub async fn query_collections(pool: &SqlitePool) -> Result<Vec<Value>, sqlx::Error> {
-    sqlx::query("SELECT id,name FROM collections")
+    sqlx::query("SELECT c.id,c.name,json_group_array(f.file_id) FILTER (WHERE files.id IS NOT NULL) AS file_ids FROM collections c LEFT JOIN favorites f ON f.collection_id=c.id LEFT JOIN files ON files.id=f.file_id AND files.is_deleted=0 GROUP BY c.id,c.name")
         .fetch_all(pool)
         .await?
         .iter()
-        .map(|row| row_to_object(row, &["id", "name"]))
+        .map(|row| {
+            let mut collection = row_to_object(row, &["id", "name"])?;
+            let ids: String = row.try_get("file_ids")?;
+            collection["file_ids"] = serde_json::from_str(&ids).map_err(|_| sqlx::Error::Protocol("invalid collection membership".into()))?;
+            Ok(collection)
+        })
         .collect()
 }
 
@@ -366,6 +371,9 @@ fn parse_path_file_id(file_id: &str) -> Option<i64> {
 
 fn import_path_is_denied(path: &Path) -> bool {
     let path = crate::path_guard::normalize_path(path);
+    let Ok(path) = crate::path_guard::resolve_non_strict(&path) else {
+        return true;
+    };
     let normalize_base = |base: &Path| {
         std::fs::canonicalize(base)
             .ok()
@@ -811,6 +819,7 @@ mod tests {
         CREATE TABLE tags (id INTEGER, tag TEXT);
         CREATE TABLE file_tags (file_id INTEGER, tag_id INTEGER);
         CREATE TABLE collections (id INTEGER, name TEXT);
+        CREATE TABLE favorites (file_id INTEGER, collection_id INTEGER);
         CREATE TABLE file_ratings (file_id INTEGER, rating);
         CREATE TABLE file_annotations (file_id INTEGER, source TEXT, key TEXT, value, confidence, created_at);
     ";
@@ -1084,6 +1093,20 @@ mod tests {
         assert!(index.get("file_annotations").is_none());
     }
 
+    #[tokio::test]
+    async fn collections_export_only_actual_active_members() {
+        let pool = fixture_pool().await;
+        sqlx::query("INSERT INTO favorites VALUES (1,9),(3,9)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let collections = query_collections(&pool).await.unwrap();
+        assert_eq!(
+            collections,
+            vec![json!({"id":9,"name":"fixture set","file_ids":[1]})]
+        );
+    }
+
     #[test]
     fn duplicate_file_ids_keep_first_seen_order() {
         assert_eq!(unique_file_ids(&[3, 1, 3, 2, 1]), vec![3, 1, 2]);
@@ -1258,6 +1281,14 @@ mod tests {
             .clone();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0]["id"], 6);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn import_deny_paths_resolve_parent_components() {
+        for path in ["/x/../etc/passwd", "/x/../etc/nonexistent/file"] {
+            assert!(import_path_is_denied(Path::new(path)), "{path}");
+        }
     }
 
     #[test]

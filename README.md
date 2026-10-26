@@ -53,6 +53,30 @@ The one thing worth repeating outside that document: **authorization is enforced
 in each route's body, not by a declaration.** There is no `require=` attribute to
 scan for. Read the function.
 
+## Security compatibility
+
+Token renewal requires an existing, non-revoked inbound token record created by
+pairing. A discovered or registered public key alone does not authorize renewal.
+Unauthenticated registration inserts new peers only; it cannot replace an
+existing key or endpoint. Endpoint changes use signed discovery or pairing.
+
+Requests carrying `X-Peer-Nonce` append the nonce and a newline to the existing
+canonical signed message, after the body-hash line. Both sender and verifier
+must use this format. Older peers that sign only the original message must be
+updated before using nonce-required routes (including fleet operations and
+token renewal). There is no fallback to unsigned nonces. Nonce-free requests
+retain their existing wire format. Use `sign_peer_headers` for nonce-bearing
+requests; `make_signature_headers` is the legacy nonce-free helper.
+
+Collection metadata now includes `file_ids` for each collection. Imports create
+only explicitly listed membership, and only when `include_favorites` is true.
+Older metadata containing collection names alone creates no membership.
+
+Deploy these changes to every peer, including Python implementations, before
+resuming fleet operations. Review existing credentials and revoke/re-pair any
+peer whose original pairing cannot be confirmed; this update does not identify
+credentials issued through the previous renewal behavior.
+
 ## Building
 
 ```sh

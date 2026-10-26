@@ -576,6 +576,10 @@ async fn pair_verify(
         }
     };
     let completed = async {
+        // Recheck approval after the KDF; rejection, expiry and another verifier may have won.
+        if !claim_approved_pairing(&mut tx, &req.request_id, now_secs()).await? {
+            return Ok(false);
+        }
         sqlx::query(
             "INSERT INTO peer_tokens (peer_id, token_hash, issued_at, expires_at, revoked_at, source, note) \
              VALUES (?1, ?2, ?3, ?4, NULL, 'pairing', NULL) \
@@ -587,14 +591,6 @@ async fn pair_verify(
         .bind(&token_hash)
         .bind(now)
         .bind(expires_at)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE peer_pairing_requests SET status='completed', pin_hash=NULL, updated_at=?1 \
-             WHERE request_id=?2",
-        )
-        .bind(now)
-        .bind(&req.request_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -613,12 +609,16 @@ async fn pair_verify(
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        Ok::<(), sqlx::Error>(())
+        Ok::<bool, sqlx::Error>(true)
     }
     .await;
-    if let Err(e) = completed {
-        tracing::warn!("pair_verify completion failed: {e}");
-        return api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+    match completed {
+        Ok(true) => {}
+        Ok(false) => return api_err(StatusCode::UNAUTHORIZED, "pairing verification failed"),
+        Err(e) => {
+            tracing::warn!("pair_verify completion failed: {e}");
+            return api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     }
     if let Err(e) = tx.commit().await {
         tracing::warn!("pair_verify commit failed: {e}");
@@ -715,6 +715,15 @@ async fn pair_verify(
 }
 
 /// 32 random bytes, urlsafe-base64 — matches `secrets.token_urlsafe(32)` in shape.
+async fn claim_approved_pairing(
+    conn: &mut sqlx::SqliteConnection,
+    request_id: &str,
+    now: i64,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query("UPDATE peer_pairing_requests SET status='completed', pin_hash=NULL, updated_at=?1 WHERE request_id=?2 AND status='approved' AND pin_expires_at>=?1")
+        .bind(now).bind(request_id).execute(conn).await?.rows_affected() == 1)
+}
+
 fn generate_token() -> String {
     let mut raw = [0u8; 32];
     rand::rng().fill(&mut raw);
@@ -1043,6 +1052,37 @@ mod tests {
         )
         .await;
         assert_eq!(r.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn completion_claim_rechecks_rejection_expiry_and_concurrent_completion() {
+        let state = test_state().await;
+        for (id, status, expires) in [
+            ("reject", "rejected", 200),
+            ("expired", "approved", 99),
+            ("done", "completed", 200),
+            ("valid", "approved", 200),
+        ] {
+            sqlx::query("INSERT INTO peer_pairing_requests (request_id,peer_id,host,port,status,pin_expires_at,created_at,updated_at) VALUES (?,'peer','10.0.0.1',5000,?,?,0,0)")
+                .bind(id).bind(status).bind(expires).execute(&state.db).await.unwrap();
+            let mut tx = state.db.begin().await.unwrap();
+            assert_eq!(
+                claim_approved_pairing(&mut tx, id, 100).await.unwrap(),
+                id == "valid"
+            );
+            tx.commit().await.unwrap();
+        }
+        let mut conn = state.db.acquire().await.unwrap();
+        assert!(!claim_approved_pairing(&mut conn, "valid", 100)
+            .await
+            .unwrap());
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM peer_pairing_requests WHERE request_id='reject'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(status, "rejected");
     }
 
     /// b-6: when the registry slot is set (native_daemon on), a successful

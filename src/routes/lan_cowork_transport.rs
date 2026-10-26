@@ -19,9 +19,7 @@ use reqwest::{
 use serde_json::{json, Map, Value};
 
 use crate::{
-    auth::peer_transport::{
-        build_canonical_message, make_nonce, path_requires_nonce, sign_canonical,
-    },
+    auth::peer_transport::{make_nonce, path_requires_nonce, sign_canonical},
     routes::{
         lan_cowork_client::build_peer_client,
         lan_cowork_host::LanCoworkHost,
@@ -289,7 +287,19 @@ pub fn build_peer_headers_at(
     body: &[u8],
 ) -> Result<HeaderMap, String> {
     let ts = timestamp.to_string();
-    let canonical = build_canonical_message(method, path, query_string, &ts, body);
+    let nonce = if path_requires_nonce(path) {
+        make_nonce()
+    } else {
+        String::new()
+    };
+    let canonical = crate::auth::peer_transport::build_nonce_canonical_message(
+        method,
+        path,
+        query_string,
+        &ts,
+        body,
+        &nonce,
+    );
     let signature =
         sign_canonical(seed, &canonical).ok_or_else(|| "could not sign peer request".to_owned())?;
     let mut headers = HeaderMap::new();
@@ -314,7 +324,7 @@ pub fn build_peer_headers_at(
         &base64::engine::general_purpose::URL_SAFE.encode(signature),
     )?;
     if path_requires_nonce(path) {
-        insert_header(&mut headers, "X-Peer-Nonce", &make_nonce())?;
+        insert_header(&mut headers, "X-Peer-Nonce", &nonce)?;
     }
     Ok(headers)
 }
@@ -494,7 +504,26 @@ mod tests {
             )
             .unwrap();
             assert_eq!(headers["X-Peer-Ts"], case["ts"].as_str().unwrap());
-            assert_eq!(headers["X-Peer-Sig"], case["sig_b64url"].as_str().unwrap());
+            if let Some(nonce) = headers.get("X-Peer-Nonce") {
+                let mut canonical = hex::decode(case["canonical_hex"].as_str().unwrap()).unwrap();
+                canonical.extend_from_slice(nonce.as_bytes());
+                canonical.push(b'\n');
+                let key = openssl::pkey::PKey::public_key_from_raw_bytes(
+                    &hex::decode(vectors["request_signature"]["pubkey_hex"].as_str().unwrap())
+                        .unwrap(),
+                    openssl::pkey::Id::ED25519,
+                )
+                .unwrap();
+                let signature = base64::engine::general_purpose::URL_SAFE
+                    .decode(headers["X-Peer-Sig"].as_bytes())
+                    .unwrap();
+                assert!(openssl::sign::Verifier::new_without_digest(&key)
+                    .unwrap()
+                    .verify_oneshot(&signature, &canonical)
+                    .unwrap());
+            } else {
+                assert_eq!(headers["X-Peer-Sig"], case["sig_b64url"].as_str().unwrap());
+            }
             assert_eq!(headers["X-Requested-With"], "PeerTransport");
         }
         let mut valid = peer(8188);

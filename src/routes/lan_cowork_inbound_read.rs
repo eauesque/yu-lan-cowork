@@ -307,7 +307,7 @@ async fn peer_status(
 
 /// POST /ext/lan_cowork/api/peer/register — unauthenticated. Validates the request,
 /// SSRF-gates the host (B-d3, stricter than Python), fetches the peer's /status,
-/// parses it panic-safely, restores existing tokens (M7), and upserts. 503 if the
+/// parses it panic-safely, and inserts new peers without replacing existing identities. 503 if the
 /// registry slot is empty (native_daemon off / identity unprovisioned).
 async fn peer_register(
     State(state): State<LanCoworkState>,
@@ -419,18 +419,36 @@ async fn peer_register(
     // Trust the validated register host/port over whatever the peer self-reports.
     peer.api_host = req.host.clone();
     peer.api_port = req.port;
-    // M7: restore tokens (the /status public dict strips them; upsert is non-COALESCE).
+    // An unauthenticated status response cannot change a known identity or endpoint.
     if let Some(existing) = registry.get(&peer.peer_id) {
-        peer.token = existing.token;
-        peer.token_expires_at = existing.token_expires_at;
-        peer.token_issued_at = existing.token_issued_at;
+        if existing.pubkey != peer.pubkey
+            || existing.api_host != peer.api_host
+            || existing.api_port != peer.api_port
+        {
+            return api_err(
+                "registered identity cannot be changed without pairing",
+                "identity_conflict",
+                StatusCode::CONFLICT,
+            );
+        }
+        return api_ok(json!({ "ok": true, "peer": to_public_dict(&existing) }));
     }
-    if registry.upsert(peer.clone()).await.is_err() {
-        return api_err(
-            "registry write failed",
-            "registry_error",
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
+    match registry.register_discovered(peer.clone()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return api_err(
+                "peer already registered",
+                "identity_conflict",
+                StatusCode::CONFLICT,
+            )
+        }
+        Err(_) => {
+            return api_err(
+                "registry write failed",
+                "registry_error",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
     }
     api_ok(json!({ "ok": true, "peer": to_public_dict(&peer) }))
 }
@@ -1138,7 +1156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_upserts_peer_and_preserves_existing_token_m7() {
+    async fn register_rejects_identity_and_endpoint_replacement() {
         use super::super::lan_cowork_descriptor::{
             reset_client_state, test_guard, TEST_ALLOW_LOOPBACK,
         };
@@ -1182,6 +1200,7 @@ mod tests {
         let mut existing = sample_peer("remote1".to_string());
         existing.token = Some("SECRET".into());
         existing.token_issued_at = Some(123);
+        let original_host = existing.api_host.clone();
         registry.upsert(existing).await.unwrap();
         let registry_arc = registry.clone();
         let lc = LanCoworkState::from_shared(&state);
@@ -1208,21 +1227,19 @@ mod tests {
         reset_client_state();
         TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
 
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        // M7: the token pre-seeded in the registry survives (was NOT nulled by the
-        // token-stripped /status upsert) and api_host is the validated register host.
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+        // The unauthenticated response cannot replace the existing endpoint or key.
         let stored = registry_arc.get("remote1").unwrap();
         assert_eq!(stored.token.as_deref(), Some("SECRET"));
-        assert_eq!(stored.api_host, "127.0.0.1");
-        // MF-1: the base64 pubkey from /status was decoded (NOT hex) and stored.
-        assert_eq!(stored.pubkey, Some([9u8; 32]));
+        assert_eq!(stored.api_host, original_host);
+        assert_eq!(stored.pubkey, None);
         // Response body is the public dict (no token).
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["ok"], serde_json::json!(true));
-        assert!(v["peer"].get("token").is_none() || v["peer"]["token"].is_null());
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["code"], "identity_conflict");
     }
 
     // ── b-4: token renew handler slot gate ─────────────────────────────────────

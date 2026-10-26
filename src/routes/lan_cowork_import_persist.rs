@@ -252,6 +252,16 @@ pub async fn write_metadata(
         let collection = collection
             .as_object()
             .ok_or_else(|| invalid_value("invalid collection"))?;
+        // Legacy peers send names only; never invent membership from a name.
+        let Some(members) = collection.get("file_ids").and_then(Value::as_array) else {
+            continue;
+        };
+        if !members
+            .iter()
+            .any(|id| id.as_i64().is_some_and(|id| id.to_string() == remote_id))
+        {
+            continue;
+        }
         let remote_collection_id = collection
             .get("id")
             .and_then(Value::as_i64)
@@ -268,9 +278,6 @@ pub async fn write_metadata(
             collection_name,
         )
         .await?;
-        if collection_id == 1 {
-            continue;
-        }
         sqlx::query(
             "INSERT OR IGNORE INTO favorites (file_id,collection_id,added_at) VALUES (?,?,?)",
         )
@@ -871,13 +878,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collections_skip_seeded_favorites_and_add_other_collections() {
+    async fn collections_require_explicit_membership_for_this_file() {
         let pool = test_db().await;
         seed_session(&pool).await;
         let file_id = new_file(&pool, "/file").await;
         let collections = vec![
             serde_json::json!({"id":1,"name":"Favorites"}),
-            serde_json::json!({"id":2,"name":"Other"}),
+            serde_json::json!({"id":2,"name":"Other","file_ids":[7]}),
+            serde_json::json!({"id":3,"name":"Unrelated","file_ids":[8]}),
         ];
         let mut conn = pool.acquire().await.unwrap();
         write_metadata(

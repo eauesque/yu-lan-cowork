@@ -195,6 +195,7 @@ mod tests {
 
     #[test]
     fn compares_path_components() {
+        assert!(!path_is_within(Path::new("/foobar/f"), Path::new("/foo")));
         assert!(path_is_within(
             Path::new("/root/file.jpg"),
             Path::new("/root")

@@ -89,18 +89,59 @@ pub fn verify_request_signature(
     ts_header: &str,
     sig_header: &str,
 ) -> bool {
+    verify_request_signature_with_nonce(
+        pubkey,
+        method,
+        path,
+        query_string,
+        body,
+        ts_header,
+        sig_header,
+        "",
+    )
+}
+
+/// Nonce-bearing requests sign the nonce as the final canonical line.
+pub fn build_nonce_canonical_message(
+    method: &str,
+    path: &str,
+    query: &str,
+    ts: &str,
+    body: &[u8],
+    nonce: &str,
+) -> Vec<u8> {
+    let mut canonical = build_canonical_message(method, path, query, ts, body);
+    if !nonce.is_empty() {
+        canonical.extend_from_slice(nonce.as_bytes());
+        canonical.push(b'\n');
+    }
+    canonical
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_request_signature_with_nonce(
+    pubkey: &[u8],
+    method: &str,
+    path: &str,
+    query_string: &str,
+    body: &[u8],
+    ts_header: &str,
+    sig_header: &str,
+    nonce: &str,
+) -> bool {
     let ts: i64 = match ts_header.parse() {
         Ok(v) => v,
         Err(_) => return false,
     };
-    if (now_secs() - ts).abs() > TS_TOLERANCE_SECS {
+    if now_secs().abs_diff(ts) > TS_TOLERANCE_SECS as u64 {
         return false;
     }
     let sig = match base64::engine::general_purpose::URL_SAFE.decode(sig_header) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let canonical = build_canonical_message(method, path, query_string, ts_header, body);
+    let canonical =
+        build_nonce_canonical_message(method, path, query_string, ts_header, body, nonce);
     let pk = match PKey::public_key_from_raw_bytes(pubkey, Id::ED25519) {
         Ok(k) => k,
         Err(_) => return false,
@@ -310,7 +351,7 @@ pub async fn require_peer_auth_with_nonce_store(
         Some(Some(pk)) => pk,
     };
 
-    if !verify_request_signature(
+    if !verify_request_signature_with_nonce(
         &pubkey,
         method,
         path,
@@ -318,6 +359,7 @@ pub async fn require_peer_auth_with_nonce_store(
         body,
         &header("X-Peer-Ts"),
         &header("X-Peer-Sig"),
+        &header("X-Peer-Nonce"),
     ) {
         return Err(err(StatusCode::UNAUTHORIZED, "signature invalid"));
     }
@@ -388,8 +430,7 @@ fn generate_raw_token() -> String {
 /// Atomically reissue a peer's inbound token unless it has been revoked. Mirrors
 /// Python `TokenStore.renew_if_not_revoked`: `BEGIN IMMEDIATE`, check `revoked_at`,
 /// and either roll back (revoked) or upsert a fresh `source='renew'` token. Returns
-/// `Ok(None)` when the current token is revoked or `peer_id` is empty; a MISSING row
-/// proceeds to issue the first token (Python parity).
+/// `Ok(None)` for unpaired or revoked peers. Discovery alone never grants a token.
 pub async fn renew_if_not_revoked(
     pool: &sqlx::SqlitePool,
     peer_id: &str,
@@ -409,15 +450,15 @@ pub async fn renew_if_not_revoked(
     ) -> Result<Option<(String, i64)>, sqlx::Error> {
         // Outer Option = row present?, inner = revoked_at value. Some(Some(_)) =
         // present and revoked -> refuse; Some(None) = present and active -> reissue;
-        // None = no row -> reissue (Python parity).
+        // None = discovered but never paired -> refuse.
         let existing: Option<Option<i64>> = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT revoked_at FROM peer_tokens WHERE peer_id = ?1",
         )
         .bind(peer_id)
         .fetch_optional(&mut *conn)
         .await?;
-        if let Some(Some(_revoked_ts)) = existing {
-            return Ok(None); // present and revoked -> refuse
+        if existing != Some(None) {
+            return Ok(None);
         }
         let raw = generate_raw_token();
         // scrypt is CPU-bound; offload like require_peer_auth does.
@@ -508,7 +549,7 @@ pub async fn require_peer_renew_auth(
         }
         Some(Some(pk)) => pk,
     };
-    if !verify_request_signature(
+    if !verify_request_signature_with_nonce(
         &pubkey,
         method,
         path,
@@ -516,6 +557,7 @@ pub async fn require_peer_renew_auth(
         body,
         &header("X-Peer-Ts"),
         &header("X-Peer-Sig"),
+        &header("X-Peer-Nonce"),
     ) {
         return Err(err(StatusCode::UNAUTHORIZED, "signature invalid"));
     }
@@ -551,8 +593,14 @@ pub struct PeerHeaderSigningInput<'a> {
 /// Signs peer request headers; the caller supplies the timestamp and nonce.
 pub fn sign_peer_headers(input: PeerHeaderSigningInput<'_>) -> Option<HeaderMap> {
     let ts_s = input.ts.to_string();
-    let canonical =
-        build_canonical_message(input.method, input.path, input.query, &ts_s, input.body);
+    let canonical = build_nonce_canonical_message(
+        input.method,
+        input.path,
+        input.query,
+        &ts_s,
+        input.body,
+        input.nonce,
+    );
     let sig = sign_canonical(input.seed, &canonical)?;
     let sig_b64 = base64::engine::general_purpose::URL_SAFE.encode(sig);
     let mut headers = HeaderMap::new();
@@ -721,6 +769,44 @@ mod tests {
                 "nonce classification mismatch for {path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn renewal_rejects_changed_nonce_and_legacy_unsigned_nonce() {
+        let (state, seed, _) = renew_auth_state_with_peer("p1").await;
+        let nonces = PeerNonceStore::with_grace(0);
+        let mut headers = sign_headers(
+            &seed,
+            "POST",
+            RENEW_PATH,
+            "",
+            b"",
+            now_secs(),
+            "original",
+            "p1",
+        );
+        assert!(
+            require_peer_renew_auth(&*state, "POST", RENEW_PATH, "", &headers, b"", &nonces)
+                .await
+                .is_ok()
+        );
+        headers.insert("X-Peer-Nonce", HeaderValue::from_static("changed"));
+        assert_eq!(
+            require_peer_renew_auth(&*state, "POST", RENEW_PATH, "", &headers, b"", &nonces)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut legacy = sign_headers(&seed, "POST", RENEW_PATH, "", b"", now_secs(), "", "p1");
+        legacy.insert("X-Peer-Nonce", HeaderValue::from_static("unsigned"));
+        assert_eq!(
+            require_peer_renew_auth(&*state, "POST", RENEW_PATH, "", &legacy, b"", &nonces)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]
@@ -908,16 +994,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renew_issues_first_token_when_none_exists() {
+    async fn renew_refuses_discovered_but_unpaired_peer() {
         let pool = renew_test_pool().await; // no row for p1
         let out = renew_if_not_revoked(&pool, "p1", 30).await.unwrap();
-        assert!(out.is_some()); // missing row -> issues first token (Python parity)
-        let source: String =
-            sqlx::query_scalar("SELECT source FROM peer_tokens WHERE peer_id='p1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(source, "renew");
+        assert!(out.is_none());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM peer_tokens WHERE peer_id='p1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

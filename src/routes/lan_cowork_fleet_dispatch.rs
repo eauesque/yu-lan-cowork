@@ -422,6 +422,7 @@ impl DispatchError {
     }
 }
 
+#[allow(clippy::double_must_use)] // async_trait generates must_use on an already must_use Future.
 #[async_trait]
 trait DispatchTransport: Send + Sync {
     async fn fetch_uptime(&self, peer_id: &str) -> Result<u64, DispatchError>;

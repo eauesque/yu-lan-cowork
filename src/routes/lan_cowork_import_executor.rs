@@ -62,6 +62,15 @@ pub(crate) async fn run(
         Some(Value::Array(value)) => value.as_slice(),
         Some(_) => return Err(sqlx::Error::Protocol("invalid import collections".into())),
     };
+    let collections = if options
+        .get("include_favorites")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        collections
+    } else {
+        &[]
+    };
     let ratings = match meta.get("file_ratings") {
         None => &Map::new(),
         Some(Value::Object(value)) => value,
@@ -851,6 +860,31 @@ mod tests {
                 .fetch_one(&pool).await.unwrap(),
             (1, 1),
         );
+    }
+
+    #[tokio::test]
+    async fn include_favorites_controls_collection_membership() {
+        let _guard = test_guard();
+        TEST_ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+        for include in [false, true] {
+            let pool = test_pool().await;
+            add_session(&pool, "session").await;
+            sqlx::raw_sql("CREATE TABLE collections (id INTEGER PRIMARY KEY,name TEXT,sort_order INTEGER,created_at INTEGER); INSERT INTO collections VALUES(1,'Favorites',0,0); CREATE TABLE favorites (file_id INTEGER,collection_id INTEGER,added_at INTEGER,PRIMARY KEY(file_id,collection_id)); CREATE TABLE import_collection_id_map (session_id TEXT,remote_peer_id TEXT,remote_collection_id INTEGER,local_collection_id INTEGER,PRIMARY KEY(session_id,remote_peer_id,remote_collection_id));").execute(&pool).await.unwrap();
+            let (port, server) =
+                response_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()).await;
+            let directory = tempdir().unwrap();
+            let registry = PeerRegistry::new(pool.clone(), Duration::from_secs(30), "local".into());
+            run(&pool, "session", &remote_peer(port), json!({"files":[{"id":7,"path":"a.txt"}],"collections":[{"id":2,"name":"Set","file_ids":[7]}]}).as_object().unwrap(), directory.path(), json!({"include_favorites":include}).as_object().unwrap(), None, &[7;32], &registry, &*semantic_test_state(true).await, false).await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM favorites")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                i64::from(include)
+            );
+            received_request(server).await;
+        }
+        TEST_ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
 
     #[tokio::test]

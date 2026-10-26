@@ -104,6 +104,38 @@ impl PeerRegistry {
             .insert(peer.peer_id.clone(), peer);
     }
 
+    /// Unauthenticated discovery may insert, but must never replace a paired identity.
+    pub(crate) async fn register_discovered(
+        &self,
+        mut peer: PeerInfo,
+    ) -> Result<bool, sqlx::Error> {
+        if peer.peer_id == self.local_peer_id
+            || peer
+                .pubkey
+                .is_some_and(|key| super::peer_identity::derive_peer_id(&key) != peer.peer_id)
+        {
+            return Ok(false);
+        }
+        peer.token = None;
+        peer.token_expires_at = None;
+        peer.token_issued_at = None;
+        let now = now_secs();
+        let inserted = sqlx::query("INSERT INTO peers (peer_id,name,api_host,api_port,pubkey,x25519_pk,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(peer_id) DO NOTHING")
+            .bind(&peer.peer_id).bind(&peer.name).bind(&peer.api_host).bind(i64::from(peer.api_port))
+            .bind(peer.pubkey.map(|key| key.to_vec())).bind(peer.x25519_pk.map(|key| key.to_vec()))
+            .bind(now).bind(now).execute(&self.db).await?.rows_affected() == 1;
+        if inserted {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.peers.contains_key(&peer.peer_id) {
+                if let Some(key) = peer.pubkey {
+                    inner.pubkey_index.insert(key, peer.peer_id.clone());
+                }
+                inner.peers.insert(peer.peer_id.clone(), peer);
+            }
+        }
+        Ok(inserted)
+    }
+
     /// Upsert a peer while retaining missing keys like DB `COALESCE`.
     ///
     /// MF-12: an incoming peer that omits pubkey/x25519 has those keys backfilled
@@ -559,6 +591,33 @@ mod tests {
         assert!(registry.list_all().is_empty());
         assert!(registry.get("nope").is_none());
         assert!(registry.get_by_pubkey(&[0; 32]).is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_insert_cannot_replace_db_identity_even_with_empty_cache() {
+        let values = vectors();
+        let pool = mem_pool(values["peers_ddl"].as_str().unwrap()).await;
+        let registry = PeerRegistry::new(pool.clone(), Duration::from_secs(30), "self0".into());
+        let peer_id = super::super::peer_identity::derive_peer_id(&[1; 32]);
+        let peer = peer_from_input(
+            &serde_json::json!({"peer_id":peer_id,"name":"original","api_host":"10.0.0.2","api_port":5000,"pubkey":hex::encode([1;32]),"token":"untrusted"}),
+            0.0,
+        );
+        assert!(registry.register_discovered(peer.clone()).await.unwrap());
+        assert!(registry.get(&peer_id).unwrap().token.is_none());
+        let empty_cache = PeerRegistry::new(pool.clone(), Duration::from_secs(30), "self0".into());
+        let mut impostor = peer;
+        impostor.api_host = "10.0.0.9".into();
+        assert!(!empty_cache.register_discovered(impostor).await.unwrap());
+        let (host, key): (String, Vec<u8>) =
+            sqlx::query_as("SELECT api_host,pubkey FROM peers WHERE peer_id=?")
+                .bind(&peer_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(host, "10.0.0.2");
+        assert_eq!(key, [1; 32]);
+        assert!(empty_cache.get(&peer_id).is_none());
     }
 
     #[tokio::test]
