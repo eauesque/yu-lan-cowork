@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
     io::Read,
     path::Path,
     process::{Command, Stdio},
@@ -27,8 +28,15 @@ enum MachineProbe<'a> {
     PowershellGpu,
 }
 
+struct ProbeSpec {
+    program: &'static str,
+    args: Vec<String>,
+    env: Vec<(&'static str, OsString)>,
+    timeout: Duration,
+}
+
 impl MachineProbe<'_> {
-    fn command(self) -> Option<(Command, Duration)> {
+    fn command(self) -> Option<ProbeSpec> {
         let (program, args, seconds): (&str, &[&str], u64) = match self {
             Self::GitBranch(_) => ("git", &["rev-parse", "--abbrev-ref", "HEAD"], 5),
             Self::GitCommit(_) => ("git", &["rev-parse", "--short", "HEAD"], 5),
@@ -65,8 +73,12 @@ impl MachineProbe<'_> {
                 5,
             ),
         };
-        let mut command = Command::new(program);
-        command.env_clear();
+        let mut spec = ProbeSpec {
+            program,
+            args: Vec::new(),
+            env: Vec::new(),
+            timeout: Duration::from_secs(seconds),
+        };
         let mut env_keys = vec!["PATH"];
         #[cfg(windows)]
         env_keys.extend(["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"]);
@@ -75,7 +87,7 @@ impl MachineProbe<'_> {
                 if path.is_empty() || path.starts_with('-') || path.chars().any(char::is_control) {
                     return None;
                 }
-                command.args(["-C", path]);
+                spec.args.extend(["-C".to_owned(), path.to_owned()]);
                 env_keys.push("HOME");
                 #[cfg(windows)]
                 env_keys.extend(["USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
@@ -84,16 +96,17 @@ impl MachineProbe<'_> {
             }
             Self::PowershellGpu => {}
             _ => {
-                command.env("LANG", "C").env("LC_ALL", "C");
+                spec.env
+                    .extend([("LANG", "C".into()), ("LC_ALL", "C".into())]);
             }
         }
         for key in env_keys {
             if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
+                spec.env.push((key, value));
             }
         }
-        command.args(args);
-        Some((command, Duration::from_secs(seconds)))
+        spec.args.extend(args.iter().map(|arg| (*arg).to_owned()));
+        Some(spec)
     }
 }
 
@@ -110,8 +123,11 @@ fn read_probe_stdout(stdout: impl Read) -> Option<String> {
 }
 
 fn command_output(probe: MachineProbe<'_>) -> Option<String> {
-    let (mut command, timeout) = probe.command()?;
-    let mut child = command
+    let spec = probe.command()?;
+    let mut child = Command::new(spec.program)
+        .env_clear()
+        .args(spec.args)
+        .envs(spec.env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -123,7 +139,7 @@ fn command_output(probe: MachineProbe<'_>) -> Option<String> {
     std::thread::spawn(move || {
         let _ = sender.send(read_probe_stdout(stdout));
     });
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + spec.timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
@@ -576,9 +592,9 @@ mod tests {
             ),
         ];
         for (probe, (args, seconds)) in probes(path).into_iter().zip(expected) {
-            let (command, timeout) = probe.command().unwrap();
-            assert_eq!(command.get_args().collect::<Vec<_>>(), args);
-            assert_eq!(timeout, Duration::from_secs(seconds));
+            let spec = probe.command().unwrap();
+            assert_eq!(spec.args, args);
+            assert_eq!(spec.timeout, Duration::from_secs(seconds));
         }
     }
 
@@ -586,7 +602,7 @@ mod tests {
     fn machine_probe_programs_are_closed() {
         let programs: Vec<_> = probes(".")
             .into_iter()
-            .map(|probe| probe.command().unwrap().0.get_program().to_owned())
+            .map(|probe| probe.command().unwrap().program)
             .collect();
         // Eight operations share six executables; the three git templates stay distinct.
         assert_eq!(
@@ -607,7 +623,7 @@ mod tests {
     #[test]
     fn machine_probe_env_is_closed() {
         for (index, probe) in probes(".").into_iter().enumerate() {
-            let (command, _) = probe.command().unwrap();
+            let spec = probe.command().unwrap();
             let mut expected = vec!["PATH"];
             #[cfg(windows)]
             expected.extend(["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"]);
@@ -620,16 +636,13 @@ mod tests {
             }
             let mut expected: std::collections::BTreeMap<_, _> = expected
                 .into_iter()
-                .filter_map(|key| std::env::var_os(key).map(|value| (key.into(), Some(value))))
+                .filter_map(|key| std::env::var_os(key).map(|value| (key, value)))
                 .collect();
             if (3..7).contains(&index) {
-                expected.insert("LANG".into(), Some("C".into()));
-                expected.insert("LC_ALL".into(), Some("C".into()));
+                expected.insert("LANG", "C".into());
+                expected.insert("LC_ALL", "C".into());
             }
-            let actual: std::collections::BTreeMap<_, _> = command
-                .get_envs()
-                .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
-                .collect();
+            let actual: std::collections::BTreeMap<_, _> = spec.env.into_iter().collect();
             assert_eq!(actual, expected);
         }
         #[cfg(unix)]
@@ -701,7 +714,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         for probe in probes(".") {
-            let path = dir.path().join(probe.command().unwrap().0.get_program());
+            let path = dir.path().join(probe.command().unwrap().program);
             std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -751,7 +764,7 @@ mod tests {
             "/bin/sleep 6 &\nexit 0",
         ) {
             let probe = MachineProbe::NvidiaSmi;
-            let (_, deadline) = probe.command().unwrap();
+            let deadline = probe.command().unwrap().timeout;
             let start = Instant::now();
             assert!(command_output(probe).is_none());
             let elapsed = start.elapsed();
