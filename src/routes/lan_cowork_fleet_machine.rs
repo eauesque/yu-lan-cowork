@@ -15,49 +15,143 @@ fn round1(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
 
-fn command_output(command: &str, args: &[&str], timeout: Duration) -> Option<String> {
-    let mut child = Command::new(command)
-        .args(args)
+#[derive(Clone, Copy)]
+enum MachineProbe<'a> {
+    GitBranch(&'a str),
+    GitCommit(&'a str),
+    GitStatus(&'a str),
+    NvidiaSmi,
+    Rocminfo,
+    RocmSmi,
+    SystemProfiler,
+    PowershellGpu,
+}
+
+impl MachineProbe<'_> {
+    fn command(self) -> Option<(Command, Duration)> {
+        let (program, args, seconds): (&str, &[&str], u64) = match self {
+            Self::GitBranch(_) => ("git", &["rev-parse", "--abbrev-ref", "HEAD"], 5),
+            Self::GitCommit(_) => ("git", &["rev-parse", "--short", "HEAD"], 5),
+            Self::GitStatus(_) => ("git", &["status", "--porcelain", "--untracked-files=no"], 5),
+            Self::NvidiaSmi => (
+                "nvidia-smi",
+                &[
+                    "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                3,
+            ),
+            Self::Rocminfo => ("rocminfo", &[], 8),
+            Self::RocmSmi => (
+                "rocm-smi",
+                &[
+                    "--showproductname",
+                    "--showmeminfo",
+                    "vram",
+                    "--showuse",
+                    "--json",
+                ],
+                5,
+            ),
+            Self::SystemProfiler => ("system_profiler", &["SPDisplaysDataType"], 5),
+            Self::PowershellGpu => (
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "(Get-CimInstance Win32_VideoController).Name",
+                ],
+                5,
+            ),
+        };
+        let mut command = Command::new(program);
+        command.env_clear();
+        let mut env_keys = vec!["PATH"];
+        #[cfg(windows)]
+        env_keys.extend(["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"]);
+        match self {
+            Self::GitBranch(path) | Self::GitCommit(path) | Self::GitStatus(path) => {
+                if path.is_empty() || path.starts_with('-') || path.chars().any(char::is_control) {
+                    return None;
+                }
+                command.args(["-C", path]);
+                env_keys.push("HOME");
+                #[cfg(windows)]
+                env_keys.extend(["USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
+                #[cfg(unix)]
+                env_keys.extend(["XDG_CONFIG_HOME", "SUDO_UID", "SUDO_GID"]);
+            }
+            Self::PowershellGpu => {}
+            _ => {
+                command.env("LANG", "C").env("LC_ALL", "C");
+            }
+        }
+        for key in env_keys {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command.args(args);
+        Some((command, Duration::from_secs(seconds)))
+    }
+}
+
+const MAX_PROBE_STDOUT: u64 = 1024 * 1024;
+
+fn read_probe_stdout(stdout: impl Read) -> Option<String> {
+    let mut output = String::new();
+    // Read one extra byte to distinguish a full response from a truncated one.
+    stdout
+        .take(MAX_PROBE_STDOUT + 1)
+        .read_to_string(&mut output)
+        .ok()?;
+    (output.len() as u64 <= MAX_PROBE_STDOUT).then_some(output)
+}
+
+fn command_output(probe: MachineProbe<'_>) -> Option<String> {
+    let (mut command, timeout) = probe.command()?;
+    let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut output = String::new();
-        stdout.read_to_string(&mut output).ok()?;
-        Some(output)
+    let stdout = child.stdout.take()?;
+    let (sender, reader) = std::sync::mpsc::channel();
+    // Detach: a grandchild can keep the pipe open after the probe exits.
+    std::thread::spawn(move || {
+        let _ = sender.send(read_probe_stdout(stdout));
     });
     let deadline = Instant::now() + timeout;
     loop {
-        match child.try_wait().ok()? {
-            Some(status) if status.success() => {
-                return reader.join().ok().flatten();
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match reader.recv_timeout(remaining) {
+                    Ok(output) => return output,
+                    Err(_) => break,
+                }
             }
-            Some(_) => {
-                let _ = reader.join();
-                return None;
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
             }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return None;
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
+            _ => break,
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
 }
 
 fn git_info(repo_path: &Path) -> Value {
-    let run = |args: &[&str]| {
-        command_output("git", args, Duration::from_secs(5)).map(|value| value.trim().to_owned())
-    };
+    let run = |probe| command_output(probe).map(|value| value.trim().to_owned());
     let path = repo_path.to_string_lossy();
     match (
-        run(&["-C", &path, "rev-parse", "--abbrev-ref", "HEAD"]),
-        run(&["-C", &path, "rev-parse", "--short", "HEAD"]),
-        run(&["-C", &path, "status", "--porcelain", "--untracked-files=no"]),
+        run(MachineProbe::GitBranch(&path)),
+        run(MachineProbe::GitCommit(&path)),
+        run(MachineProbe::GitStatus(&path)),
     ) {
         (Some(branch), Some(commit), Some(dirty)) => {
             json!({"branch": branch, "commit": commit, "dirty": !dirty.is_empty()})
@@ -154,14 +248,7 @@ fn gpu(name: String, total: Option<f64>, used: Option<f64>, utilization: Option<
 }
 
 fn gpu_nvidia_smi() -> Option<Vec<Value>> {
-    let output = command_output(
-        "nvidia-smi",
-        &[
-            "--query-gpu=name,memory.total,memory.used,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ],
-        Duration::from_secs(3),
-    )?;
+    let output = command_output(MachineProbe::NvidiaSmi)?;
     let gpus: Vec<_> = output
         .lines()
         .filter_map(|line| {
@@ -183,7 +270,7 @@ fn gpu_nvidia_smi() -> Option<Vec<Value>> {
 }
 
 fn rocminfo_names() -> Vec<String> {
-    command_output("rocminfo", &[], Duration::from_secs(8))
+    command_output(MachineProbe::Rocminfo)
         .map(|output| {
             output
                 .split("*******")
@@ -205,17 +292,7 @@ fn rocminfo_names() -> Vec<String> {
 }
 
 fn gpu_rocm_smi() -> Option<Vec<Value>> {
-    let output = command_output(
-        "rocm-smi",
-        &[
-            "--showproductname",
-            "--showmeminfo",
-            "vram",
-            "--showuse",
-            "--json",
-        ],
-        Duration::from_secs(5),
-    )?;
+    let output = command_output(MachineProbe::RocmSmi)?;
     let data = serde_json::from_str::<Value>(&output).ok()?;
     let cards = data
         .as_object()?
@@ -267,11 +344,7 @@ fn gpu_macos() -> Option<Vec<Value>> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let output = command_output(
-        "system_profiler",
-        &["SPDisplaysDataType"],
-        Duration::from_secs(5),
-    )?;
+    let output = command_output(MachineProbe::SystemProfiler)?;
     let mut name = None;
     let mut total = None;
     for line in output.lines().map(str::trim) {
@@ -303,25 +376,16 @@ fn gpu_windows_wmi() -> Vec<Value> {
     if !cfg!(target_os = "windows") {
         return Vec::new();
     }
-    command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-CimInstance Win32_VideoController).Name",
-        ],
-        Duration::from_secs(5),
-    )
-    .map(|output| {
-        output
-            .lines()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(|name| gpu(name.to_owned(), None, None, None))
-            .collect()
-    })
-    .unwrap_or_default()
+    command_output(MachineProbe::PowershellGpu)
+        .map(|output| {
+            output
+                .lines()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| gpu(name.to_owned(), None, None, None))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn gpu_info_from(
@@ -458,6 +522,284 @@ pub fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn probes(path: &str) -> [MachineProbe<'_>; 8] {
+        [
+            MachineProbe::GitBranch(path),
+            MachineProbe::GitCommit(path),
+            MachineProbe::GitStatus(path),
+            MachineProbe::NvidiaSmi,
+            MachineProbe::Rocminfo,
+            MachineProbe::RocmSmi,
+            MachineProbe::SystemProfiler,
+            MachineProbe::PowershellGpu,
+        ]
+    }
+
+    #[test]
+    fn machine_probe_argv_and_timeouts_are_fixed() {
+        let path = "repo with spaces; --option";
+        let expected: [(&[&str], u64); 8] = [
+            (&["-C", path, "rev-parse", "--abbrev-ref", "HEAD"], 5),
+            (&["-C", path, "rev-parse", "--short", "HEAD"], 5),
+            (
+                &["-C", path, "status", "--porcelain", "--untracked-files=no"],
+                5,
+            ),
+            (
+                &[
+                    "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                3,
+            ),
+            (&[], 8),
+            (
+                &[
+                    "--showproductname",
+                    "--showmeminfo",
+                    "vram",
+                    "--showuse",
+                    "--json",
+                ],
+                5,
+            ),
+            (&["SPDisplaysDataType"], 5),
+            (
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "(Get-CimInstance Win32_VideoController).Name",
+                ],
+                5,
+            ),
+        ];
+        for (probe, (args, seconds)) in probes(path).into_iter().zip(expected) {
+            let (command, timeout) = probe.command().unwrap();
+            assert_eq!(command.get_args().collect::<Vec<_>>(), args);
+            assert_eq!(timeout, Duration::from_secs(seconds));
+        }
+    }
+
+    #[test]
+    fn machine_probe_programs_are_closed() {
+        let programs: Vec<_> = probes(".")
+            .into_iter()
+            .map(|probe| probe.command().unwrap().0.get_program().to_owned())
+            .collect();
+        // Eight operations share six executables; the three git templates stay distinct.
+        assert_eq!(
+            programs,
+            [
+                "git",
+                "git",
+                "git",
+                "nvidia-smi",
+                "rocminfo",
+                "rocm-smi",
+                "system_profiler",
+                "powershell"
+            ]
+        );
+    }
+
+    #[test]
+    fn machine_probe_env_is_closed() {
+        for (index, probe) in probes(".").into_iter().enumerate() {
+            let (command, _) = probe.command().unwrap();
+            let mut expected = vec!["PATH"];
+            #[cfg(windows)]
+            expected.extend(["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"]);
+            if index < 3 {
+                expected.push("HOME");
+                #[cfg(windows)]
+                expected.extend(["USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
+                #[cfg(unix)]
+                expected.extend(["XDG_CONFIG_HOME", "SUDO_UID", "SUDO_GID"]);
+            }
+            let mut expected: std::collections::BTreeMap<_, _> = expected
+                .into_iter()
+                .filter_map(|key| std::env::var_os(key).map(|value| (key.into(), Some(value))))
+                .collect();
+            if (3..7).contains(&index) {
+                expected.insert("LANG".into(), Some("C".into()));
+                expected.insert("LC_ALL".into(), Some("C".into()));
+            }
+            let actual: std::collections::BTreeMap<_, _> = command
+                .get_envs()
+                .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
+                .collect();
+            assert_eq!(actual, expected);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A separate test process avoids mutating the parallel test suite's environment.
+            if std::env::var_os("MACHINE_PROBE_ENV_TEST").is_some() {
+                for probe in probes(".") {
+                    assert_eq!(command_output(probe).as_deref(), Some("closed"));
+                }
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let script = "#!/bin/sh\n[ \"${LD_PRELOAD+x}${DYLD_INSERT_LIBRARIES+x}${PYTHONPATH+x}${NODE_OPTIONS+x}${GIT_DIR+x}${MACHINE_PROBE_ENV_TEST+x}\" = \"\" ] || exit 1\nprintf closed\n";
+            for program in [
+                "git",
+                "nvidia-smi",
+                "rocminfo",
+                "rocm-smi",
+                "system_profiler",
+                "powershell",
+            ] {
+                let path = dir.path().join(program);
+                std::fs::write(&path, script).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routes::lan_cowork_fleet_machine::tests::machine_probe_env_is_closed",
+                    "--nocapture",
+                ])
+                .env("PATH", dir.path())
+                .env("MACHINE_PROBE_ENV_TEST", "1")
+                .env("HOME", "probe-home")
+                .env("XDG_CONFIG_HOME", "probe-xdg")
+                .env("SUDO_UID", "1234")
+                .env("SUDO_GID", "5678")
+                .env("LD_PRELOAD", "")
+                .env("DYLD_INSERT_LIBRARIES", "")
+                .env("PYTHONPATH", "probe-sentinel")
+                .env("NODE_OPTIONS", "probe-sentinel")
+                .env("GIT_DIR", "probe-sentinel")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
+    #[test]
+    fn machine_probe_stdout_is_bounded() {
+        let limit = 1024 * 1024;
+        let data = vec![b'x'; limit + 16];
+        assert_eq!(read_probe_stdout(&data[..limit]).unwrap().len(), limit);
+        let mut reader = std::io::Cursor::new(&data);
+        assert!(read_probe_stdout(&mut reader).is_none());
+        assert_eq!(reader.position(), (limit + 1) as u64);
+        assert_eq!(read_probe_stdout(&b""[..]).as_deref(), Some(""));
+        assert!(read_probe_stdout(&b"\xff"[..]).is_none());
+    }
+
+    #[cfg(unix)]
+    fn probe_fixture(test: &str, script: &str) -> bool {
+        use std::{io::Write, os::unix::fs::PermissionsExt};
+
+        if std::env::var_os("MACHINE_PROBE_FIXTURE_TEST").is_some() {
+            return true;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for probe in probes(".") {
+            let path = dir.path().join(probe.command().unwrap().0.get_program());
+            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("routes::lan_cowork_fleet_machine::tests::{test}"),
+                "--nocapture",
+            ])
+            .env("PATH", dir.path())
+            .env("MACHINE_PROBE_FIXTURE_TEST", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"inherited\n".repeat(8).as_slice())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_probe_stdin_is_null() {
+        if probe_fixture(
+            "machine_probe_stdin_is_null",
+            "if read -r line; then exit 1; fi\nprintf closed",
+        ) {
+            for probe in probes(".") {
+                assert_eq!(command_output(probe).as_deref(), Some("closed"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_probe_deadline_bounds_inherited_stdout() {
+        if probe_fixture(
+            "machine_probe_deadline_bounds_inherited_stdout",
+            "/bin/sleep 6 &\nexit 0",
+        ) {
+            let probe = MachineProbe::NvidiaSmi;
+            let (_, deadline) = probe.command().unwrap();
+            let start = Instant::now();
+            assert!(command_output(probe).is_none());
+            let elapsed = start.elapsed();
+            assert!(elapsed >= deadline, "returned early: {elapsed:?}");
+            assert!(
+                elapsed < deadline + Duration::from_millis(500),
+                "{elapsed:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_probe_command_output_enforces_cap() {
+        if probe_fixture(
+            "machine_probe_command_output_enforces_cap",
+            "/bin/dd if=/dev/zero bs=\"$2\" count=1 2>/dev/null | /usr/bin/tr '\\000' x",
+        ) {
+            let output = command_output(MachineProbe::GitBranch("1048576")).unwrap();
+            assert_eq!(output.len(), 1024 * 1024);
+            assert!(output.bytes().all(|byte| byte == b'x'));
+            assert!(command_output(MachineProbe::GitBranch("1048577")).is_none());
+        }
+    }
+
+    #[test]
+    fn machine_probe_rejects_invalid_repo_paths_before_spawn() {
+        for path in [
+            "",
+            "-repo",
+            "--help",
+            "repo\0name",
+            "repo\nname",
+            "repo\rname",
+            "repo\tname",
+            "repo\u{7f}name",
+            "repo\u{85}name",
+        ] {
+            for probe in [
+                MachineProbe::GitBranch(path),
+                MachineProbe::GitCommit(path),
+                MachineProbe::GitStatus(path),
+            ] {
+                assert!(probe.command().is_none(), "accepted {path:?}");
+                assert!(command_output(probe).is_none());
+            }
+        }
+    }
 
     #[test]
     fn fleet_machine_info_schema_and_roles_match_python() {
