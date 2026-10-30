@@ -542,7 +542,8 @@ fn inspect_zip(
         {
             return None;
         }
-        let (remote_id, name) = entry.name().split_once('/')?;
+        let entry_name = entry.name().ok()?;
+        let (remote_id, name) = entry_name.split_once('/')?;
         let remote_id = remote_id.parse::<i64>().ok()?;
         if !allowed_ids.contains(&remote_id)
             || !remote_ids.insert(remote_id)
@@ -579,7 +580,10 @@ fn zip_header_names_agree(file: &mut fs::File, archive: &mut zip::ZipArchive<fs:
 
     for index in 0..archive.len() {
         let (central_name, offset) = match archive.by_index_raw(index) {
-            Ok(entry) => (entry.name().as_bytes().to_vec(), entry.header_start()),
+            Ok(entry) => match entry.name() {
+                Ok(name) => (name.as_bytes().to_vec(), entry.header_start()),
+                Err(_) => return false,
+            },
             Err(_) => return false,
         };
 
@@ -635,7 +639,10 @@ fn extract_zip(file: fs::File, dest_folder: &Path) -> HashMap<i64, PathBuf> {
         };
         // zip may apply Info-ZIP Unicode Path extras and retains NULs unlike CPython;
         // validate the crate-reported name instead of reparsing raw directory bytes.
-        let name = entry.name().to_owned();
+        let Ok(name) = entry.name().map(|name| name.into_owned()) else {
+            failed = true;
+            break;
+        };
         let Some((rid, fname)) = name.split_once('/') else {
             failed = true;
             break;
@@ -1463,6 +1470,73 @@ mod tests {
         assert!(!directory.path().join("good.txt").exists());
         assert!(!directory.path().join("bad.txt").exists());
         assert!(!directory.path().join("later.txt").exists());
+    }
+
+    #[test]
+    fn extract_zip_removes_all_created_files_on_underdeclared_size() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("keep.txt"), b"keep").unwrap();
+        let mut bytes = zip_bytes(&[
+            ("1/good.txt", b"good"),
+            ("2/bad.txt", b"bad"),
+            ("3/later.txt", b"later"),
+        ]);
+        // Keep the CRC intact: the size check must catch this even when it matches.
+        for (signature, size_offset) in [(b"PK\x03\x04", 22), (b"PK\x01\x02", 24)] {
+            let at = bytes
+                .windows(4)
+                .enumerate()
+                .filter_map(|(at, part)| (part == signature).then_some(at))
+                .nth(1)
+                .unwrap();
+            bytes[at + size_offset..at + size_offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        }
+        assert!(extract_zip(zip_file(&bytes), directory.path()).is_empty());
+        assert_eq!(
+            fs::read(directory.path().join("keep.txt")).unwrap(),
+            b"keep"
+        );
+        assert!(!directory.path().join("good.txt").exists());
+        assert!(!directory.path().join("bad.txt").exists());
+        assert!(!directory.path().join("later.txt").exists());
+    }
+
+    #[test]
+    fn inspect_and_extract_zip_reject_unsafe_entry_names() {
+        for name in [
+            "2/../escape.txt",
+            "2/..\\escape.txt",
+            "2//absolute.txt",
+            "2/C:\\absolute.txt",
+            "2/bad\0name.txt",
+        ] {
+            let bytes = zip_bytes(&[("1/good.txt", b"good"), (name, b"bad")]);
+            assert!(inspect_zip(
+                zip_file(&bytes),
+                &HashSet::from([1, 2]),
+                10,
+                4096,
+                4096,
+                100,
+            )
+            .is_none());
+            let directory = tempdir().unwrap();
+            assert!(extract_zip(zip_file(&bytes), directory.path()).is_empty());
+            assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn inspect_and_extract_zip_preserve_utf8_entry_names() {
+        let bytes = zip_bytes(&[("1/画像/猫.png", b"image")]);
+        let (file, expanded) =
+            inspect_zip(zip_file(&bytes), &HashSet::from([1]), 10, 4096, 4096, 100)
+                .expect("matching UTF-8 header names must be accepted");
+        assert_eq!(expanded, 5);
+        let directory = tempdir().unwrap();
+        let extracted = extract_zip(file, directory.path());
+        assert_eq!(extracted[&1], directory.path().join("画像/猫.png"));
+        assert_eq!(fs::read(&extracted[&1]).unwrap(), b"image");
     }
 
     #[test]

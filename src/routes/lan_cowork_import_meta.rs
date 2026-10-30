@@ -1446,7 +1446,14 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let names = (0..archive.len())
-            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .map(|index| {
+                archive
+                    .by_index(index)
+                    .unwrap()
+                    .name()
+                    .unwrap()
+                    .into_owned()
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             names,
